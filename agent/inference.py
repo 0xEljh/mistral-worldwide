@@ -114,6 +114,9 @@ class LlamaCppServerConfig:
     startup_timeout_seconds: float = 120.0
     host: str = "127.0.0.1"
     port: int = 8081
+    gpu_layers: str = "auto"
+    cpu_only: bool = False
+    cpu_fallback: bool = True
     binary_path: Path = _DEFAULT_LLAMA_SERVER_PATH
 
 
@@ -264,6 +267,7 @@ class LlamaCppServerInference:
         self._stderr_thread: threading.Thread | None = None
         self._stdout_chunks: list[str] = []
         self._stderr_chunks: list[str] = []
+        self._started_in_cpu_mode = False
 
         if not self._config.binary_path.exists():
             raise FileNotFoundError(
@@ -287,20 +291,44 @@ class LlamaCppServerInference:
         if process is not None:
             self.stop()
 
-        command = [
-            str(self._config.binary_path),
-            "--hf-repo",
-            self.model_ref,
-            "--ctx-size",
-            str(self._config.context_size),
-            "--host",
-            self._config.host,
-            "--port",
-            str(self._config.port),
-        ]
+        if self._config.cpu_only:
+            self._emit_log(
+                on_stderr,
+                "[llm] Starting llama-server in CPU-only mode (--device none).\n",
+            )
+            self._start_once(cpu_only=True, on_stderr=on_stderr)
+            return
 
-        if self._config.threads is not None:
-            command.extend(["--threads", str(self._config.threads)])
+        self._emit_log(
+            on_stderr,
+            "[llm] Starting llama-server with GPU offload enabled.\n",
+        )
+
+        try:
+            self._start_once(cpu_only=False, on_stderr=on_stderr)
+        except Exception as gpu_exc:
+            if not self._config.cpu_fallback:
+                raise
+
+            self._emit_log(
+                on_stderr,
+                "[llm] GPU startup failed; retrying in CPU-only mode.\n",
+            )
+            try:
+                self._start_once(cpu_only=True, on_stderr=on_stderr)
+            except Exception as cpu_exc:
+                raise RuntimeError(
+                    "Failed to start llama-server with GPU and CPU fallback. "
+                    f"gpu_error={gpu_exc} cpu_error={cpu_exc}"
+                ) from cpu_exc
+
+    def _start_once(
+        self,
+        *,
+        cpu_only: bool,
+        on_stderr: StreamChunkHandler | None,
+    ) -> None:
+        command = self._build_server_command(cpu_only=cpu_only)
 
         env = os.environ.copy()
         process = subprocess.Popen(
@@ -322,6 +350,7 @@ class LlamaCppServerInference:
         self._stdout_chunks = []
         self._stderr_chunks = []
         self._process = process
+        self._started_in_cpu_mode = cpu_only
         self._stdout_thread = threading.Thread(
             target=_drain_text_stream,
             args=(process.stdout, self._stdout_chunks, on_stderr),
@@ -340,6 +369,32 @@ class LlamaCppServerInference:
         except Exception:
             self.stop()
             raise
+
+    def _build_server_command(self, *, cpu_only: bool) -> list[str]:
+        command = [
+            str(self._config.binary_path),
+            "--hf-repo",
+            self.model_ref,
+            "--ctx-size",
+            str(self._config.context_size),
+            "--host",
+            self._config.host,
+            "--port",
+            str(self._config.port),
+        ]
+
+        if cpu_only:
+            command.extend(["--device", "none", "--n-gpu-layers", "0"])
+        else:
+            gpu_layers = self._config.gpu_layers.strip()
+            if not gpu_layers:
+                gpu_layers = "auto"
+            command.extend(["--n-gpu-layers", gpu_layers])
+
+        if self._config.threads is not None:
+            command.extend(["--threads", str(self._config.threads)])
+
+        return command
 
     def stop(self) -> None:
         process = self._process
@@ -361,6 +416,7 @@ class LlamaCppServerInference:
             if process.stderr is not None:
                 process.stderr.close()
             self._process = None
+            self._started_in_cpu_mode = False
 
     def generate(
         self,
@@ -452,9 +508,11 @@ class LlamaCppServerInference:
         stdout = "".join(self._stdout_chunks).strip()
         stderr_tail = stderr[-4000:] if len(stderr) > 4000 else stderr
         stdout_tail = stdout[-1000:] if len(stdout) > 1000 else stdout
+        backend_mode = "cpu" if self._started_in_cpu_mode else "gpu"
         raise RuntimeError(
             "llama-server did not become ready before startup timeout "
-            f"(timeout={self._config.startup_timeout_seconds}s, model={self.model_ref}). "
+            f"(timeout={self._config.startup_timeout_seconds}s, model={self.model_ref}, "
+            f"backend={backend_mode}). "
             f"last_error={last_error!r} "
             f"stderr={stderr_tail or '<empty>'} stdout={stdout_tail or '<empty>'}"
         )
@@ -472,9 +530,10 @@ class LlamaCppServerInference:
         stdout = "".join(self._stdout_chunks).strip()
         stderr_tail = stderr[-4000:] if len(stderr) > 4000 else stderr
         stdout_tail = stdout[-1000:] if len(stdout) > 1000 else stdout
+        backend_mode = "cpu" if self._started_in_cpu_mode else "gpu"
         raise RuntimeError(
             "llama-server process is not running "
-            f"(exit={return_code}, model={self.model_ref}). "
+            f"(exit={return_code}, model={self.model_ref}, backend={backend_mode}). "
             f"stderr={stderr_tail or '<empty>'} stdout={stdout_tail or '<empty>'}"
         )
 
@@ -485,6 +544,18 @@ class LlamaCppServerInference:
             self._stderr_thread.join(timeout=1.0)
         self._stdout_thread = None
         self._stderr_thread = None
+
+    def _emit_log(
+        self,
+        handler: StreamChunkHandler | None,
+        message: str,
+    ) -> None:
+        if handler is None:
+            return
+        try:
+            handler(message)
+        except Exception:
+            return
 
     def _read_non_streaming_response(self, response: Any) -> str:
         raw_body = response.read().decode("utf-8", errors="replace")

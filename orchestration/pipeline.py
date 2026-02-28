@@ -46,6 +46,9 @@ def run_pipeline(
     api_ingest_port: int = 8000,
     api_ingest_startup_timeout_seconds: float = 5.0,
     llm_server_port: int = 8081,
+    llm_gpu_layers: str = "auto",
+    llm_cpu_only: bool = False,
+    llm_cpu_fallback: bool = True,
 ) -> None:
     shared_state = WorldState()
     stop_event = threading.Event()
@@ -163,6 +166,9 @@ def run_pipeline(
             LlamaCppServerConfig(
                 quantization=quantization,
                 port=llm_server_port,
+                gpu_layers=llm_gpu_layers,
+                cpu_only=llm_cpu_only,
+                cpu_fallback=llm_cpu_fallback,
             )
         )
         inference.start(
@@ -216,6 +222,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=8081,
         help="Port for persistent embedded llama-server process.",
+    )
+    parser.add_argument(
+        "--llm-gpu-layers",
+        default="auto",
+        help="llama.cpp --n-gpu-layers value (default: auto).",
+    )
+    parser.add_argument(
+        "--llm-cpu-only",
+        action="store_true",
+        help="Force llama-server to run without GPU offload.",
+    )
+    parser.add_argument(
+        "--no-llm-cpu-fallback",
+        action="store_true",
+        help="Disable automatic CPU fallback if GPU startup fails.",
     )
     parser.add_argument(
         "--poll-interval-seconds",
@@ -322,6 +343,9 @@ def main() -> None:
         api_ingest_port=args.api_ingest_port,
         api_ingest_startup_timeout_seconds=args.api_ingest_startup_timeout_seconds,
         llm_server_port=args.llm_server_port,
+        llm_gpu_layers=args.llm_gpu_layers,
+        llm_cpu_only=args.llm_cpu_only,
+        llm_cpu_fallback=not args.no_llm_cpu_fallback,
     )
 
 

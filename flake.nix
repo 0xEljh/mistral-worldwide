@@ -8,7 +8,16 @@
   outputs = { self, nixpkgs }:
     let
       system = "x86_64-linux";
-      pkgs = nixpkgs.legacyPackages.${system};
+      pkgs = import nixpkgs {
+        inherit system;
+        config = {
+          allowUnfree = true;
+        };
+      };
+      llamaCppCuda = pkgs.llama-cpp.override {
+        cudaSupport = true;
+        cudaPackages = pkgs.cudaPackages;
+      };
     in {
       devShells.${system}.default = pkgs.mkShell {
         buildInputs = with pkgs; [
@@ -24,7 +33,7 @@
           findutils
 
           # Useful for local GGUF tooling and conversion workflows.
-          llama-cpp
+          llamaCppCuda
         ];
 
         shellHook = ''
@@ -59,8 +68,8 @@
           LLAMA_CPP_DIR="$PWD/llama.cpp"
           mkdir -p "$LLAMA_CPP_DIR"
           for bin in llama-quantize llama-cli llama-server llama-gguf-split; do
-            if [ -e "${pkgs.llama-cpp}/bin/$bin" ]; then
-              ln -sf "${pkgs.llama-cpp}/bin/$bin" "$LLAMA_CPP_DIR/$bin"
+            if [ -e "${llamaCppCuda}/bin/$bin" ]; then
+              ln -sf "${llamaCppCuda}/bin/$bin" "$LLAMA_CPP_DIR/$bin"
             fi
           done
 
