@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import cv2
 import websockets
@@ -56,7 +60,79 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Optional capture height (0 keeps camera default).",
     )
+    parser.add_argument(
+        "--debug-check",
+        action="store_true",
+        help="Run /debug/frame-status and /debug/save-frame checks after a few frames.",
+    )
+    parser.add_argument(
+        "--debug-base-url",
+        default="",
+        help="HTTP base URL for debug endpoints (defaults to ws URL host).",
+    )
+    parser.add_argument(
+        "--debug-check-after",
+        type=int,
+        default=10,
+        help="Run debug checks after this many frames are sent.",
+    )
     return parser.parse_args()
+
+
+def _default_debug_base_url(ws_url: str) -> str:
+    parsed = urllib.parse.urlparse(ws_url)
+    if parsed.scheme not in {"ws", "wss"}:
+        raise ValueError("--url must use ws:// or wss://")
+
+    http_scheme = "https" if parsed.scheme == "wss" else "http"
+    return urllib.parse.urlunparse((http_scheme, parsed.netloc, "", "", "", ""))
+
+
+def _http_json_request(url: str, method: str) -> dict:
+    request = urllib.request.Request(url=url, method=method)
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body)
+
+
+async def _run_debug_checks(base_url: str) -> None:
+    status_url = urllib.parse.urljoin(base_url + "/", "debug/frame-status")
+    save_url = urllib.parse.urljoin(base_url + "/", "debug/save-frame")
+
+    print(f"[debug] Checking ingestion: GET {status_url}")
+    try:
+        status_payload = await asyncio.to_thread(_http_json_request, status_url, "GET")
+    except urllib.error.URLError as exc:
+        print(f"[debug] Ingestion check failed: {exc}")
+        return
+
+    has_frame = bool(status_payload.get("has_frame"))
+    age_seconds = status_payload.get("age_seconds")
+    shape = status_payload.get("shape")
+    if has_frame:
+        print(
+            f"[debug] Ingestion check OK: has_frame=true age_seconds={age_seconds} shape={shape}"
+        )
+    else:
+        print("[debug] Ingestion check NOT READY: has_frame=false")
+        return
+
+    print(f"[debug] Checking save-frame: POST {save_url}")
+    try:
+        save_payload = await asyncio.to_thread(_http_json_request, save_url, "POST")
+    except urllib.error.URLError as exc:
+        print(f"[debug] Save-frame check failed: {exc}")
+        return
+
+    saved = bool(save_payload.get("saved"))
+    saved_path = save_payload.get("path")
+    saved_shape = save_payload.get("shape")
+    if saved:
+        print(
+            f"[debug] Save-frame check OK: saved=true path={saved_path} shape={saved_shape}"
+        )
+    else:
+        print("[debug] Save-frame check FAILED: saved flag not true")
 
 
 async def stream_frames(args: argparse.Namespace) -> None:
@@ -74,6 +150,8 @@ async def stream_frames(args: argparse.Namespace) -> None:
 
     sent = 0
     started_at = time.time()
+    debug_checked = False
+    debug_base_url = args.debug_base_url.strip() or _default_debug_base_url(args.url)
 
     print(f"Connecting to {args.url}")
     print("Press Ctrl+C to stop streaming")
@@ -95,6 +173,14 @@ async def stream_frames(args: argparse.Namespace) -> None:
 
                 await websocket.send(encoded.tobytes())
                 sent += 1
+
+                if (
+                    args.debug_check
+                    and not debug_checked
+                    and sent >= args.debug_check_after
+                ):
+                    await _run_debug_checks(debug_base_url)
+                    debug_checked = True
 
                 if sent % 30 == 0:
                     elapsed = max(1e-6, time.time() - started_at)
