@@ -73,7 +73,8 @@ class WorldState:
                 obj.update(center, conf, self.frame_index, xyxy)
 
                 if not prev_moving_state and obj.moving:
-                    self.events.append(f"{obj.type}_{track_id} moved")
+                    direction = DIRECTION_MAPPING[round(4*math.atan2(-obj.velocity[1], obj.velocity[0])/math.pi)]
+                    self.events.append(f"{obj.type}_{track_id} moved" + " " + direction)
         # Adds New Objects
             else:
                 self.objects[track_id] = WorldObject(track_id, class_name, center, conf, self.frame_index, xyxy)
@@ -197,7 +198,7 @@ frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 print(frame_width,frame_height)
 
-model = YOLO("yolo26n.pt")
+model = YOLO("yolo26x.pt")
 
 state = WorldState()
 
