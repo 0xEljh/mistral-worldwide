@@ -424,13 +424,59 @@ class LlamaCppServerInference:
         on_stdout: StreamChunkHandler | None = None,
         on_stderr: StreamChunkHandler | None = None,
     ) -> str:
+        return self._request_chat_completion(
+            messages=prompt.messages,
+            max_tokens=self._config.max_tokens,
+            temperature=self._config.temperature,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+        )
+
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        on_stdout: StreamChunkHandler | None = None,
+        on_stderr: StreamChunkHandler | None = None,
+    ) -> str:
+        resolved_max_tokens = (
+            self._config.max_tokens if max_tokens is None else max_tokens
+        )
+        resolved_temperature = (
+            self._config.temperature if temperature is None else temperature
+        )
+
+        if resolved_max_tokens <= 0:
+            raise ValueError("max_tokens must be > 0")
+        if resolved_temperature < 0.0:
+            raise ValueError("temperature must be >= 0")
+
+        return self._request_chat_completion(
+            messages=messages,
+            max_tokens=resolved_max_tokens,
+            temperature=resolved_temperature,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+        )
+
+    def _request_chat_completion(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        on_stdout: StreamChunkHandler | None,
+        on_stderr: StreamChunkHandler | None,
+    ) -> str:
         self._ensure_running()
 
         payload = {
             "model": self.model_ref,
-            "messages": prompt.messages,
-            "max_tokens": self._config.max_tokens,
-            "temperature": self._config.temperature,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
             "stream": on_stdout is not None,
         }
         request = urllib.request.Request(

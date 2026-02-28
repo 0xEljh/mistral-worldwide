@@ -8,7 +8,9 @@ from agent.prompt_builder import PromptBundle, build_prompt
 
 SceneState = Mapping[str, Any]
 SceneStateProvider = Callable[[], SceneState]
-PromptBuilder = Callable[[SceneState, str], PromptBundle]
+AuxiliaryContext = Mapping[str, Any]
+AuxiliaryContextProvider = Callable[[], AuxiliaryContext]
+PromptBuilder = Callable[[SceneState, str, AuxiliaryContext | None], PromptBundle]
 StreamChunkHandler = Callable[[str], None]
 
 
@@ -33,10 +35,11 @@ class AgentLoop:
         self,
         scene_state: SceneState,
         user_prompt: str = "",
+        auxiliary_context: AuxiliaryContext | None = None,
         on_model_stdout: StreamChunkHandler | None = None,
         on_model_stderr: StreamChunkHandler | None = None,
     ) -> AgentTurn:
-        prompt = self._prompt_builder(scene_state, user_prompt)
+        prompt = self._prompt_builder(scene_state, user_prompt, auxiliary_context)
         response = self._inference.generate(
             prompt,
             on_stdout=on_model_stdout,
@@ -57,6 +60,7 @@ class AgentLoop:
         poll_interval_seconds: float = 1.0,
         require_initialized_state: bool = True,
         max_steps: int | None = None,
+        auxiliary_context_provider: AuxiliaryContextProvider | None = None,
         on_turn: Callable[[AgentTurn], None] | None = None,
         on_model_stdout: StreamChunkHandler | None = None,
         on_model_stderr: StreamChunkHandler | None = None,
@@ -71,9 +75,16 @@ class AgentLoop:
                 time.sleep(poll_interval_seconds)
                 continue
 
+            auxiliary_context = (
+                auxiliary_context_provider()
+                if auxiliary_context_provider is not None
+                else None
+            )
+
             turn = self.step(
                 scene_state,
                 user_prompt=user_prompt,
+                auxiliary_context=auxiliary_context,
                 on_model_stdout=on_model_stdout,
                 on_model_stderr=on_model_stderr,
             )

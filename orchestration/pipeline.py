@@ -7,6 +7,7 @@ import time
 from typing import Any, cast
 
 from api.embedded_server import EmbeddedApiServer
+from agent.crop_describer import CropDescriptionStore, run_crop_description_loop
 from agent.inference import LlamaCppServerConfig, LlamaCppServerInference
 from agent.loop import AgentLoop, AgentTurn
 from perception.frame_provider import FrameSourceMode
@@ -31,6 +32,7 @@ def run_pipeline(
     user_prompt: str = "",
     quantization: str = "Q4_K_M",
     poll_interval_seconds: float = 1.0,
+    crop_description_poll_interval_seconds: float = 0.5,
     max_steps: int | None = None,
     stream_llm_output: bool = True,
     perception_startup_timeout_seconds: float = 5.0,
@@ -51,10 +53,12 @@ def run_pipeline(
     llm_cpu_fallback: bool = True,
 ) -> None:
     shared_state = WorldState()
+    crop_description_store = CropDescriptionStore()
     stop_event = threading.Event()
     failure_box: dict[str, Exception | None] = {"error": None}
     embedded_api_server: EmbeddedApiServer | None = None
     perception_thread: threading.Thread | None = None
+    crop_description_thread: threading.Thread | None = None
     inference: LlamaCppServerInference | None = None
 
     try:
@@ -174,16 +178,57 @@ def run_pipeline(
         inference.start(
             on_stderr=_on_model_stderr if stream_llm_output else None,
         )
+
+        def _crop_description_target() -> None:
+            active_inference = cast(LlamaCppServerInference, inference)
+            try:
+                run_crop_description_loop(
+                    inference=active_inference,
+                    crops_provider=shared_state.crop_snapshot,
+                    object_type_provider=shared_state.object_types_snapshot,
+                    store=crop_description_store,
+                    stop_event=stop_event,
+                    poll_interval_seconds=crop_description_poll_interval_seconds,
+                    on_error=_on_model_stderr if stream_llm_output else None,
+                )
+            except Exception as exc:  # pragma: no cover - best effort crash forwarding
+                failure_box["error"] = exc
+
+        crop_description_thread = threading.Thread(
+            target=_crop_description_target,
+            daemon=True,
+        )
+        crop_description_thread.start()
+
         agent_loop = AgentLoop(inference=inference)
 
         def _state_provider() -> dict[str, Any]:
             if failure_box["error"] is not None:
-                raise RuntimeError("Perception loop failed") from failure_box["error"]
+                raise RuntimeError("Pipeline background loop failed") from failure_box[
+                    "error"
+                ]
 
             if not perception_thread.is_alive() and not stop_event.is_set():
                 raise RuntimeError("Perception loop exited unexpectedly")
 
             return shared_state.snapshot()
+
+        def _auxiliary_context_provider() -> dict[str, Any]:
+            if failure_box["error"] is not None:
+                raise RuntimeError("Pipeline background loop failed") from failure_box[
+                    "error"
+                ]
+
+            if (
+                crop_description_thread is not None
+                and not crop_description_thread.is_alive()
+                and not stop_event.is_set()
+            ):
+                raise RuntimeError("Crop description loop exited unexpectedly")
+
+            return {
+                "object_descriptions": crop_description_store.snapshot(),
+            }
 
         agent_loop.run(
             state_provider=_state_provider,
@@ -191,6 +236,7 @@ def run_pipeline(
             poll_interval_seconds=poll_interval_seconds,
             require_initialized_state=False,
             max_steps=max_steps,
+            auxiliary_context_provider=_auxiliary_context_provider,
             on_turn=(
                 _streaming_turn_handler if stream_llm_output else _default_turn_handler
             ),
@@ -199,6 +245,8 @@ def run_pipeline(
         )
     finally:
         stop_event.set()
+        if crop_description_thread is not None:
+            crop_description_thread.join(timeout=5.0)
         if inference is not None:
             inference.stop()
         if perception_thread is not None:
@@ -242,7 +290,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--poll-interval-seconds",
         type=float,
         default=1.0,
-        help="Agent polling interval",
+        help="Agent polling interval in seconds.",
+    )
+    parser.add_argument(
+        "--crop-description-poll-interval-seconds",
+        type=float,
+        default=0.5,
+        help="Crop-to-text polling interval in seconds.",
     )
     parser.add_argument(
         "--max-steps",
@@ -328,6 +382,9 @@ def main() -> None:
         user_prompt=args.user_prompt,
         quantization=args.quantization,
         poll_interval_seconds=args.poll_interval_seconds,
+        crop_description_poll_interval_seconds=(
+            args.crop_description_poll_interval_seconds
+        ),
         max_steps=args.max_steps,
         stream_llm_output=not args.no_stream_llm_output,
         perception_startup_timeout_seconds=args.perception_startup_timeout_seconds,

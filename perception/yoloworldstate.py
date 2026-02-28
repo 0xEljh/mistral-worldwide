@@ -45,6 +45,7 @@ DIRECTION_MAPPING = {
     4: "left",
 }
 
+
 def safe_crop(frame, xyxy, buffer_px=10):
     h, w = frame.shape[:2]
 
@@ -60,6 +61,7 @@ def safe_crop(frame, xyxy, buffer_px=10):
     y2 = min(h, y2)
 
     return frame[y1:y2, x1:x2]
+
 
 class WorldState:
     """
@@ -174,13 +176,13 @@ class WorldState:
                 index = max(-4, min(4, index))
 
                 direction = DIRECTION_MAPPING[index]
-                overlapping = bbox_iou(a.xyxy, b.xyxy) > IOU_THRESHOLD
+                overlapping = bool((bbox_iou(a.xyxy, b.xyxy) > IOU_THRESHOLD).item())
 
                 near = dist < DISTANCE_THRESHOLD
 
                 key = frozenset({id_a, id_b})
 
-                self.relations[key] = Relation(
+                self.relations[key] = Relation(  # type: ignore[index]
                     subject_id=f"{a.type}_{a.track_id}",
                     direction=direction,
                     near=near,
@@ -191,7 +193,8 @@ class WorldState:
 
     # Deprecated, useful for getting current graph later
     def _compute_relations(self) -> None:
-        self.relations = []
+        self.relations = []  # type: ignore[assignment]
+        relations = cast(list[Relation], self.relations)
 
         objs = list(self.objects.values())
         for i, a in enumerate(objs):
@@ -212,13 +215,14 @@ class WorldState:
                 id_a = f"{a.type}_{a.track_id}"
                 id_b = f"{b.type}_{b.track_id}"
 
-                self.relations.append(
+                relations.append(
                     Relation(
                         subject_id=id_a,
                         direction=direction,
                         near=dist < DISTANCE_THRESHOLD,
                         overlapping=overlap,
                         object_id=id_b,
+                        last_updated=self.frame_index,
                     )
                 )
 
@@ -233,6 +237,14 @@ class WorldState:
                 "relations": [rel.to_dict() for rel in self.relations.values()],
                 "recent_events": list(self.events),
             }
+
+    def crop_snapshot(self) -> dict[int, np.ndarray]:
+        with self._lock:
+            return dict(self.crops)
+
+    def object_types_snapshot(self) -> dict[int, str]:
+        with self._lock:
+            return {track_id: obj.type for track_id, obj in self.objects.items()}
 
 
 class Relation:
@@ -302,7 +314,7 @@ class WorldObject:
         self.prev_center = self.center
         self.center = center
         self.velocity = (vx, vy)
-        speed = math.hypot(vx,vy)
+        speed = math.hypot(vx, vy)
 
         if speed > MOVEMENT_THRESHOLD:
             self.motion_counter += 1
@@ -310,12 +322,16 @@ class WorldObject:
         else:
             self.stationary_counter += 1
             self.motion_counter = 0
-        
-        if (not self.moving) and (self.motion_counter >= MOTION_START_CONTINUOUS_FRAME_THRESHOLD):
+
+        if (not self.moving) and (
+            self.motion_counter >= MOTION_START_CONTINUOUS_FRAME_THRESHOLD
+        ):
             self.moving = True
-        elif (self.moving) and (self.stationary_counter >= MOTION_STOP_CONTINUOUS_FRAME_THRESHOLD):
+        elif (self.moving) and (
+            self.stationary_counter >= MOTION_STOP_CONTINUOUS_FRAME_THRESHOLD
+        ):
             self.moving = False
-        
+
         self.confidence = confidence
         self.last_seen = frame_idx
         self.visible = True
@@ -464,7 +480,9 @@ def run_world_state_tracking_loop(
             if not results:
                 continue
 
-            world_state.update_from_detections(frame, results[0].names, results[0].boxes)
+            world_state.update_from_detections(
+                frame, results[0].names, results[0].boxes
+            )
 
             if on_snapshot is not None:
                 on_snapshot(world_state.snapshot())
@@ -568,12 +586,12 @@ def main() -> None:
     )
 
     print(final_state.snapshot())
-    #for track_id, crop in final_state.crops.items():
-        #if crop is not None:
-        #    window_name = f"Crop_{track_id}"
-        #    cv2.imshow(window_name, crop)
-        #    cv2.waitKey(0) # 0 means wait indefinitely until a key is pressed
-        #    cv2.destroyAllWindows()
+    # for track_id, crop in final_state.crops.items():
+    # if crop is not None:
+    #    window_name = f"Crop_{track_id}"
+    #    cv2.imshow(window_name, crop)
+    #    cv2.waitKey(0) # 0 means wait indefinitely until a key is pressed
+    #    cv2.destroyAllWindows()
     if args.output_json:
         with open("output.json", "w") as json_file:
             json.dump(final_state.snapshot(), json_file, indent=4)
