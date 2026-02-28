@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, TextIO
+from typing import Any, Callable, TextIO
 
 from agent.prompt_builder import PromptBundle
 
 _DEFAULT_LLAMA_CLI_PATH = (
     Path(__file__).resolve().parents[1] / "llama.cpp" / "llama-cli"
+)
+_DEFAULT_LLAMA_SERVER_PATH = (
+    Path(__file__).resolve().parents[1] / "llama.cpp" / "llama-server"
 )
 
 _QUANTIZATION_ALIASES = {
@@ -93,6 +100,21 @@ class LlamaCppConfig:
     threads: int | None = None
     timeout_seconds: float = 120.0
     binary_path: Path = _DEFAULT_LLAMA_CLI_PATH
+
+
+@dataclass(frozen=True)
+class LlamaCppServerConfig:
+    hf_repo: str = "unsloth/Ministral-3-3B-Instruct-2512-GGUF"
+    quantization: str = "Q4_K_M"
+    max_tokens: int = 256
+    context_size: int = 8192
+    temperature: float = 0.2
+    threads: int | None = None
+    timeout_seconds: float = 120.0
+    startup_timeout_seconds: float = 120.0
+    host: str = "127.0.0.1"
+    port: int = 8081
+    binary_path: Path = _DEFAULT_LLAMA_SERVER_PATH
 
 
 class LlamaCppInference:
@@ -229,3 +251,331 @@ class LlamaCppInference:
             )
 
         return response
+
+
+class LlamaCppServerInference:
+    """Persistent local inference through llama.cpp's llama-server."""
+
+    def __init__(self, config: LlamaCppServerConfig | None = None) -> None:
+        self._config = config or LlamaCppServerConfig()
+        self._quantization = _normalize_quantization(self._config.quantization)
+        self._process: subprocess.Popen[str] | None = None
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._stdout_chunks: list[str] = []
+        self._stderr_chunks: list[str] = []
+
+        if not self._config.binary_path.exists():
+            raise FileNotFoundError(
+                f"llama-server not found at {self._config.binary_path}. "
+                "Build or symlink llama.cpp first."
+            )
+
+    @property
+    def model_ref(self) -> str:
+        return f"{self._config.hf_repo}:{self._quantization}"
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self._config.host}:{self._config.port}"
+
+    def start(self, on_stderr: StreamChunkHandler | None = None) -> None:
+        process = self._process
+        if process is not None and process.poll() is None:
+            return
+
+        if process is not None:
+            self.stop()
+
+        command = [
+            str(self._config.binary_path),
+            "--hf-repo",
+            self.model_ref,
+            "--ctx-size",
+            str(self._config.context_size),
+            "--host",
+            self._config.host,
+            "--port",
+            str(self._config.port),
+        ]
+
+        if self._config.threads is not None:
+            command.extend(["--threads", str(self._config.threads)])
+
+        env = os.environ.copy()
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            process.wait(timeout=1.0)
+            raise RuntimeError("llama-server did not expose stdout/stderr pipes")
+
+        self._stdout_chunks = []
+        self._stderr_chunks = []
+        self._process = process
+        self._stdout_thread = threading.Thread(
+            target=_drain_text_stream,
+            args=(process.stdout, self._stdout_chunks, on_stderr),
+            daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=_drain_text_stream,
+            args=(process.stderr, self._stderr_chunks, on_stderr),
+            daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+        try:
+            self._wait_until_ready()
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        process = self._process
+        if process is None:
+            return
+
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5.0)
+        finally:
+            self._join_stream_threads()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            self._process = None
+
+    def generate(
+        self,
+        prompt: PromptBundle,
+        on_stdout: StreamChunkHandler | None = None,
+        on_stderr: StreamChunkHandler | None = None,
+    ) -> str:
+        self._ensure_running()
+
+        payload = {
+            "model": self.model_ref,
+            "messages": prompt.messages,
+            "max_tokens": self._config.max_tokens,
+            "temperature": self._config.temperature,
+            "stream": on_stdout is not None,
+        }
+        request = urllib.request.Request(
+            url=f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self._config.timeout_seconds,
+            ) as response:
+                if on_stdout is None:
+                    return self._read_non_streaming_response(response)
+                return self._read_streaming_response(response, on_stdout)
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace").strip()
+            if on_stderr is not None and error_body:
+                try:
+                    on_stderr(error_body)
+                except Exception:
+                    on_stderr = None
+            raise RuntimeError(
+                "llama-server chat completion request failed "
+                f"(status={exc.code}, model={self.model_ref}). "
+                f"body={error_body or '<empty>'}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            if on_stderr is not None:
+                try:
+                    on_stderr(str(exc))
+                except Exception:
+                    on_stderr = None
+            raise RuntimeError(
+                f"Failed to reach llama-server for chat completion at {self.base_url}."
+            ) from exc
+
+    def __enter__(self) -> LlamaCppServerInference:
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object | None,
+    ) -> None:
+        del exc_type, exc, tb
+        self.stop()
+
+    def _wait_until_ready(self) -> None:
+        deadline = time.monotonic() + max(self._config.startup_timeout_seconds, 0.0)
+        last_error: Exception | None = None
+        health_request = urllib.request.Request(
+            url=f"{self.base_url}/health",
+            method="GET",
+        )
+
+        while True:
+            self._ensure_running()
+            try:
+                with urllib.request.urlopen(health_request, timeout=2.0) as response:
+                    if 200 <= response.status < 300:
+                        return
+            except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+                last_error = exc
+
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+
+        stderr = "".join(self._stderr_chunks).strip()
+        stdout = "".join(self._stdout_chunks).strip()
+        stderr_tail = stderr[-4000:] if len(stderr) > 4000 else stderr
+        stdout_tail = stdout[-1000:] if len(stdout) > 1000 else stdout
+        raise RuntimeError(
+            "llama-server did not become ready before startup timeout "
+            f"(timeout={self._config.startup_timeout_seconds}s, model={self.model_ref}). "
+            f"last_error={last_error!r} "
+            f"stderr={stderr_tail or '<empty>'} stdout={stdout_tail or '<empty>'}"
+        )
+
+    def _ensure_running(self) -> None:
+        process = self._process
+        if process is None:
+            raise RuntimeError("llama-server is not running. Call start() first.")
+
+        return_code = process.poll()
+        if return_code is None:
+            return
+
+        stderr = "".join(self._stderr_chunks).strip()
+        stdout = "".join(self._stdout_chunks).strip()
+        stderr_tail = stderr[-4000:] if len(stderr) > 4000 else stderr
+        stdout_tail = stdout[-1000:] if len(stdout) > 1000 else stdout
+        raise RuntimeError(
+            "llama-server process is not running "
+            f"(exit={return_code}, model={self.model_ref}). "
+            f"stderr={stderr_tail or '<empty>'} stdout={stdout_tail or '<empty>'}"
+        )
+
+    def _join_stream_threads(self) -> None:
+        if self._stdout_thread is not None:
+            self._stdout_thread.join(timeout=1.0)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1.0)
+        self._stdout_thread = None
+        self._stderr_thread = None
+
+    def _read_non_streaming_response(self, response: Any) -> str:
+        raw_body = response.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            body_tail = raw_body[-1000:] if len(raw_body) > 1000 else raw_body
+            raise RuntimeError(
+                "llama-server returned invalid JSON for chat completion. "
+                f"body={body_tail or '<empty>'}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("llama-server chat completion payload is not an object")
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("llama-server chat completion payload has no choices")
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise RuntimeError("llama-server chat completion choice is not an object")
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError("llama-server chat completion choice has no message")
+
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("llama-server chat completion returned empty content")
+
+        return content.strip()
+
+    def _read_streaming_response(
+        self,
+        response: Any,
+        on_stdout: StreamChunkHandler,
+    ) -> str:
+        chunks: list[str] = []
+        chunk_handler: StreamChunkHandler | None = on_stdout
+
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+
+            payload = line[len("data:") :].strip()
+            if payload == "[DONE]":
+                break
+
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+
+            if not isinstance(event, dict):
+                continue
+
+            choices = event.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                continue
+
+            piece = ""
+            delta = first_choice.get("delta")
+            if isinstance(delta, dict):
+                delta_content = delta.get("content")
+                if isinstance(delta_content, str):
+                    piece = delta_content
+
+            if not piece:
+                message = first_choice.get("message")
+                if isinstance(message, dict):
+                    message_content = message.get("content")
+                    if isinstance(message_content, str):
+                        piece = message_content
+
+            if not piece:
+                continue
+
+            chunks.append(piece)
+            if chunk_handler is not None:
+                try:
+                    chunk_handler(piece)
+                except Exception:
+                    chunk_handler = None
+
+        response_text = "".join(chunks).strip()
+        if not response_text:
+            raise RuntimeError("llama-server returned an empty streaming response")
+        return response_text

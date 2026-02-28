@@ -7,7 +7,7 @@ import time
 from typing import Any, cast
 
 from api.embedded_server import EmbeddedApiServer
-from agent.inference import LlamaCppConfig, LlamaCppInference
+from agent.inference import LlamaCppServerConfig, LlamaCppServerInference
 from agent.loop import AgentLoop, AgentTurn
 from perception.frame_provider import FrameSourceMode
 from perception.yoloworldstate import WorldState, run_world_state_tracking_loop
@@ -45,12 +45,14 @@ def run_pipeline(
     api_ingest_host: str = "0.0.0.0",
     api_ingest_port: int = 8000,
     api_ingest_startup_timeout_seconds: float = 5.0,
+    llm_server_port: int = 8081,
 ) -> None:
     shared_state = WorldState()
     stop_event = threading.Event()
     failure_box: dict[str, Exception | None] = {"error": None}
     embedded_api_server: EmbeddedApiServer | None = None
     perception_thread: threading.Thread | None = None
+    inference: LlamaCppServerInference | None = None
 
     try:
         if frame_source_mode in {"auto", "api"}:
@@ -150,19 +152,23 @@ def run_pipeline(
 
             time.sleep(0.05)
 
-        print("[pipeline] Loading LLM inference engine...")
-        inference = LlamaCppInference(
-            LlamaCppConfig(
-                quantization=quantization,
-            )
-        )
-        agent_loop = AgentLoop(inference=inference)
-
         def _on_model_stdout(chunk: str) -> None:
             print(chunk, end="", flush=True)
 
         def _on_model_stderr(chunk: str) -> None:
             print(chunk, end="", flush=True, file=sys.stderr)
+
+        print("[pipeline] Loading LLM inference engine...")
+        inference = LlamaCppServerInference(
+            LlamaCppServerConfig(
+                quantization=quantization,
+                port=llm_server_port,
+            )
+        )
+        inference.start(
+            on_stderr=_on_model_stderr if stream_llm_output else None,
+        )
+        agent_loop = AgentLoop(inference=inference)
 
         def _state_provider() -> dict[str, Any]:
             if failure_box["error"] is not None:
@@ -187,6 +193,8 @@ def run_pipeline(
         )
     finally:
         stop_event.set()
+        if inference is not None:
+            inference.stop()
         if perception_thread is not None:
             perception_thread.join(timeout=5.0)
         if embedded_api_server is not None:
@@ -202,6 +210,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--quantization",
         default="Q4_K_M",
         help="GGUF quantization (e.g. Q4_K_M for 4-bit or Q2_K for 2-bit)",
+    )
+    parser.add_argument(
+        "--llm-server-port",
+        type=int,
+        default=8081,
+        help="Port for persistent embedded llama-server process.",
     )
     parser.add_argument(
         "--poll-interval-seconds",
@@ -307,6 +321,7 @@ def main() -> None:
         api_ingest_host=args.api_ingest_host,
         api_ingest_port=args.api_ingest_port,
         api_ingest_startup_timeout_seconds=args.api_ingest_startup_timeout_seconds,
+        llm_server_port=args.llm_server_port,
     )
 
 
