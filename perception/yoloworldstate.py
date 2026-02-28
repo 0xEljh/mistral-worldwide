@@ -4,6 +4,7 @@ import argparse
 import math
 import threading
 import time
+import json
 from collections import deque
 from typing import Callable, cast
 
@@ -56,7 +57,7 @@ class WorldState:
 
     def __init__(self, max_events: int = MAX_EVENTS):
         self.objects: dict[int, WorldObject] = {}
-        self.relations: list[Relation] = []
+        self.relations: dict[set, Relation] = {} # key: frozenset({id_a, id_b}), value: relation object
         self.events: deque[str] = deque(maxlen=max_events)
 
         self.version = 0
@@ -120,9 +121,50 @@ class WorldState:
                     obj.mark_missing()
                     self.events.append(f"{obj.type}_{track_id} disappeared")
 
-            self._compute_relations()
+            self._update_relations_delta(seen_ids)
 
-    # TODO: reduce O(n^2) time complexity.
+    def _update_relations_delta(self, seen_ids):
+        objs = self.objects
+        visible_ids = [
+            tid for tid in seen_ids
+            if objs[tid].visible
+        ]
+
+        for i in range(len(visible_ids)):
+            for j in range(i + 1, len(visible_ids)):
+                id_a = visible_ids[i]
+                id_b = visible_ids[j]
+
+                a = objs[id_a]
+                b = objs[id_b]
+
+                ax, ay = a.center
+                bx, by = b.center
+
+                dx = ax - bx
+                dy = by - ay  # y-axis flipped
+
+                dist = math.dist(a.center, b.center)
+
+                index = int(round(4 * math.atan2(dy, dx) / math.pi))
+                index = max(-4, min(4, index))
+
+                direction = DIRECTION_MAPPING[index]
+                overlapping = bbox_iou(a.xyxy, b.xyxy) > IOU_THRESHOLD
+
+                near = dist < DISTANCE_THRESHOLD
+
+                key = frozenset({id_a, id_b})
+
+                self.relations[key] = Relation(
+                    subject_id=f"{a.type}_{a.track_id}",
+                    direction=direction,
+                    near=near,
+                    overlapping=overlapping,
+                    object_id=f"{b.type}_{b.track_id}",
+                    last_updated=self.frame_index
+                )
+# Deprecated, useful for getting current graph later
     def _compute_relations(self) -> None:
         self.relations = []
 
@@ -163,7 +205,7 @@ class WorldState:
                 "objects": [
                     obj.to_dict() for obj in self.objects.values() if obj.visible
                 ],
-                "relations": [rel.to_dict() for rel in self.relations],
+                "relations": [rel.to_dict() for rel in self.relations.values()],
                 "recent_events": list(self.events),
             }
 
@@ -176,12 +218,14 @@ class Relation:
         near: bool,
         overlapping: bool,
         object_id: str,
+        last_updated
     ):
         self.subject_id = subject_id
         self.direction = direction
         self.near = near
         self.overlapping = overlapping
         self.object_id = object_id
+        self.last_updated = last_updated
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -194,6 +238,7 @@ class Relation:
                 + ("overlapping" if self.overlapping else "not overlapping")
             ),
             "object": self.object_id,
+            "last_updated": self.last_updated
         }
 
 
@@ -449,6 +494,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable OpenCV display window.",
     )
+    parser.add_argument(
+        "--output-json",
+        action="store_true",
+        help="output json to be sent to LLM for debugging"
+    )
     return parser
 
 
@@ -467,6 +517,10 @@ def main() -> None:
         switch_cooldown_seconds=args.switch_cooldown_seconds,
     )
     print(final_state.snapshot())
+    if args.output_json:
+        with open('output.json', 'w') as json_file:
+            json.dump(final_state.snapshot(), json_file, indent=4)
+
 
 
 if __name__ == "__main__":
