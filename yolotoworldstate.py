@@ -7,9 +7,8 @@ from ultralytics.utils.metrics import bbox_iou
 
 IOU_THRESHOLD = 0.5
 DISTANCE_THRESHOLD = 100
-MOVEMENT_THRESHOLD = 8
+MOVEMENT_THRESHOLD = 16
 MAX_EVENTS = 20
-DISAPPEARANCE_THRESHOLD = 15
 
 DIRECTION_MAPPING = {
     -4: "left", 
@@ -69,10 +68,10 @@ class WorldState:
         # Updates Existing Objects
             if track_id in self.objects:
                 obj = self.objects[track_id]
-                prev_moving_state = obj.moving
+                prev_center = obj.center
                 obj.update(center, conf, self.frame_index, xyxy)
 
-                if not prev_moving_state and obj.moving:
+                if obj.moving:
                     self.events.append(f"{obj.type}_{track_id} moved")
         # Adds New Objects
             else:
@@ -81,7 +80,7 @@ class WorldState:
 
         # Handle disappearances
         for track_id, obj in self.objects.items():
-            if (track_id not in seen_ids) and ((self.frame_index - obj.last_seen) > DISAPPEARANCE_THRESHOLD):
+            if track_id not in seen_ids:
                 if obj.visible:
                     obj.mark_missing()
                     self.events.append(f"{obj.type}_{track_id} disappeared")
@@ -208,8 +207,8 @@ while True:
         print("Can't receive frame (stream end?). Exiting ...")
         break
 
-    results = model.track(frame, persist=True, tracker="botsort.yaml")
-    #results = model.track(frame, persist=True)
+    #results = model.track(frame, persist=True, tracker="botsort.yaml")
+    results = model.track(frame, persist=True)
     annotated_frame = results[0].plot()
     # Display the annotated frame
     cv2.imshow("YOLO26 Tracking", annotated_frame)
