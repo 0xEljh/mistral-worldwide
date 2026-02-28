@@ -25,6 +25,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
 IOU_THRESHOLD = 0.5
 DISTANCE_THRESHOLD = 100
 MOVEMENT_THRESHOLD = 8
+MOTION_START_CONTINUOUS_FRAME_THRESHOLD = 4
+MOTION_STOP_CONTINUOUS_FRAME_THRESHOLD = 4
 MAX_EVENTS = 20
 DISAPPEARANCE_THRESHOLD = 15
 IDLE_SLEEP_SECONDS = 0.01
@@ -100,6 +102,8 @@ class WorldState:
                             )
                         ]
                         self.events.append(f"{obj.type}_{track_id} moved {direction}")
+                    elif prev_moving_state and not obj.moving:
+                        self.events.append(f"{obj.type}_{track_id} stopped")
                 else:
                     self.objects[track_id] = WorldObject(
                         track_id,
@@ -262,6 +266,8 @@ class WorldObject:
 
         self.visible = True
         self.moving = False
+        self.motion_counter = 0
+        self.stationary_counter = 0
 
         self.confidence = confidence
         self.first_seen = frame_idx
@@ -275,8 +281,20 @@ class WorldObject:
         self.prev_center = self.center
         self.center = center
         self.velocity = (vx, vy)
+        speed = math.hypot(vx,vy)
 
-        self.moving = (abs(vx) + abs(vy)) > MOVEMENT_THRESHOLD
+        if speed > MOVEMENT_THRESHOLD:
+            self.motion_counter += 1
+            self.stationary_counter = 0
+        else:
+            self.stationary_counter += 1
+            self.motion_counter = 0
+        
+        if (not self.moving) and (self.motion_counter >= MOTION_START_CONTINUOUS_FRAME_THRESHOLD):
+            self.moving = True
+        elif (self.moving) and (self.stationary_counter >= MOTION_STOP_CONTINUOUS_FRAME_THRESHOLD):
+            self.moving = False
+        
         self.confidence = confidence
         self.last_seen = frame_idx
         self.visible = True
