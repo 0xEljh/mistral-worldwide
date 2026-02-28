@@ -31,6 +31,7 @@ MAX_EVENTS = 20
 DISAPPEARANCE_THRESHOLD = 15
 IDLE_SLEEP_SECONDS = 0.01
 WAIT_LOG_INTERVAL_SECONDS = 2.0
+CROP_BUFFER = 10
 
 DIRECTION_MAPPING = {
     -4: "left",
@@ -44,6 +45,21 @@ DIRECTION_MAPPING = {
     4: "left",
 }
 
+def safe_crop(frame, xyxy, buffer_px=10):
+    h, w = frame.shape[:2]
+
+    x1 = int(xyxy[0].item()) - buffer_px
+    y1 = int(xyxy[1].item()) - buffer_px
+    x2 = int(xyxy[2].item()) + buffer_px
+    y2 = int(xyxy[3].item()) + buffer_px
+
+    # Clamp to image boundaries
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+
+    return frame[y1:y2, x1:x2]
 
 class WorldState:
     """
@@ -59,6 +75,7 @@ class WorldState:
 
     def __init__(self, max_events: int = MAX_EVENTS):
         self.objects: dict[int, WorldObject] = {}
+        self.crops = {}
         self.relations: dict[
             set, Relation
         ] = {}  # key: frozenset({id_a, id_b}), value: relation object
@@ -68,7 +85,7 @@ class WorldState:
         self.frame_index = 0
         self._lock = threading.Lock()
 
-    def update_from_detections(self, names, boxes) -> None:
+    def update_from_detections(self, frame, names, boxes) -> None:
         with self._lock:
             self.frame_index += 1
             if boxes.id is None:
@@ -81,6 +98,10 @@ class WorldState:
             for i in range(num_detections):
                 track_id = int(boxes.id[i].item())
                 xyxy = boxes.xyxy[i]
+
+                crop = safe_crop(frame, xyxy, buffer_px=CROP_BUFFER)
+                self.crops[track_id] = crop
+
                 center = (
                     (boxes.xyxy[i, 0] + boxes.xyxy[i, 2]).item() / 2,
                     (boxes.xyxy[i, 1] + boxes.xyxy[i, 3]).item() / 2,
@@ -443,7 +464,7 @@ def run_world_state_tracking_loop(
             if not results:
                 continue
 
-            world_state.update_from_detections(results[0].names, results[0].boxes)
+            world_state.update_from_detections(frame, results[0].names, results[0].boxes)
 
             if on_snapshot is not None:
                 on_snapshot(world_state.snapshot())
@@ -547,6 +568,12 @@ def main() -> None:
     )
 
     print(final_state.snapshot())
+    #for track_id, crop in final_state.crops.items():
+        #if crop is not None:
+        #    window_name = f"Crop_{track_id}"
+        #    cv2.imshow(window_name, crop)
+        #    cv2.waitKey(0) # 0 means wait indefinitely until a key is pressed
+        #    cv2.destroyAllWindows()
     if args.output_json:
         with open("output.json", "w") as json_file:
             json.dump(final_state.snapshot(), json_file, indent=4)
