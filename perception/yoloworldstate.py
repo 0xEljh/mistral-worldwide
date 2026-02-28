@@ -57,7 +57,9 @@ class WorldState:
 
     def __init__(self, max_events: int = MAX_EVENTS):
         self.objects: dict[int, WorldObject] = {}
-        self.relations: dict[set, Relation] = {} # key: frozenset({id_a, id_b}), value: relation object
+        self.relations: dict[
+            set, Relation
+        ] = {}  # key: frozenset({id_a, id_b}), value: relation object
         self.events: deque[str] = deque(maxlen=max_events)
 
         self.version = 0
@@ -125,10 +127,7 @@ class WorldState:
 
     def _update_relations_delta(self, seen_ids):
         objs = self.objects
-        visible_ids = [
-            tid for tid in seen_ids
-            if objs[tid].visible
-        ]
+        visible_ids = [tid for tid in seen_ids if objs[tid].visible]
 
         for i in range(len(visible_ids)):
             for j in range(i + 1, len(visible_ids)):
@@ -162,9 +161,10 @@ class WorldState:
                     near=near,
                     overlapping=overlapping,
                     object_id=f"{b.type}_{b.track_id}",
-                    last_updated=self.frame_index
+                    last_updated=self.frame_index,
                 )
-# Deprecated, useful for getting current graph later
+
+    # Deprecated, useful for getting current graph later
     def _compute_relations(self) -> None:
         self.relations = []
 
@@ -218,7 +218,7 @@ class Relation:
         near: bool,
         overlapping: bool,
         object_id: str,
-        last_updated
+        last_updated,
     ):
         self.subject_id = subject_id
         self.direction = direction
@@ -238,7 +238,7 @@ class Relation:
                 + ("overlapping" if self.overlapping else "not overlapping")
             ),
             "object": self.object_id,
-            "last_updated": self.last_updated
+            "last_updated": self.last_updated,
         }
 
 
@@ -416,7 +416,12 @@ def run_world_state_tracking_loop(
                 time.sleep(IDLE_SLEEP_SECONDS)
                 continue
 
-            results = model.track(frame, persist=True, tracker=tracker_path)
+            results = model.track(
+                source=frame,
+                persist=True,
+                tracker=tracker_path,
+                verbose=False,
+            )
             if not results:
                 continue
 
@@ -497,7 +502,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-json",
         action="store_true",
-        help="output json to be sent to LLM for debugging"
+        help="output json to be sent to LLM for debugging",
     )
     return parser
 
@@ -505,6 +510,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
+
+    if args.frame_source_mode == "api":
+        print(
+            "[api] Standalone perception CLI does not start embedded ingestion. "
+            "Use 'python -m orchestration.pipeline' for embedded API ingest."
+        )
 
     final_state = run_world_state_tracking_loop(
         camera_index=args.camera_index,
@@ -516,11 +527,11 @@ def main() -> None:
         switch_to_api_after_consecutive=args.switch_to_api_after_consecutive,
         switch_cooldown_seconds=args.switch_cooldown_seconds,
     )
+
     print(final_state.snapshot())
     if args.output_json:
-        with open('output.json', 'w') as json_file:
+        with open("output.json", "w") as json_file:
             json.dump(final_state.snapshot(), json_file, indent=4)
-
 
 
 if __name__ == "__main__":

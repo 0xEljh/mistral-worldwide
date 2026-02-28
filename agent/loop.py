@@ -9,6 +9,7 @@ from agent.prompt_builder import PromptBundle, build_prompt
 SceneState = Mapping[str, Any]
 SceneStateProvider = Callable[[], SceneState]
 PromptBuilder = Callable[[SceneState, str], PromptBundle]
+StreamChunkHandler = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -28,9 +29,19 @@ class AgentLoop:
         self._inference = inference
         self._prompt_builder = prompt_builder
 
-    def step(self, scene_state: SceneState, user_prompt: str = "") -> AgentTurn:
+    def step(
+        self,
+        scene_state: SceneState,
+        user_prompt: str = "",
+        on_model_stdout: StreamChunkHandler | None = None,
+        on_model_stderr: StreamChunkHandler | None = None,
+    ) -> AgentTurn:
         prompt = self._prompt_builder(scene_state, user_prompt)
-        response = self._inference.generate(prompt)
+        response = self._inference.generate(
+            prompt,
+            on_stdout=on_model_stdout,
+            on_stderr=on_model_stderr,
+        )
 
         return AgentTurn(
             world_version=int(scene_state.get("world_version", -1)),
@@ -44,13 +55,13 @@ class AgentLoop:
         state_provider: SceneStateProvider,
         user_prompt: str = "",
         poll_interval_seconds: float = 1.0,
-        only_on_scene_change: bool = True,
         require_initialized_state: bool = True,
         max_steps: int | None = None,
         on_turn: Callable[[AgentTurn], None] | None = None,
+        on_model_stdout: StreamChunkHandler | None = None,
+        on_model_stderr: StreamChunkHandler | None = None,
     ) -> None:
         steps = 0
-        last_seen_world_version: int | None = None
 
         while max_steps is None or steps < max_steps:
             scene_state = state_provider()
@@ -60,16 +71,13 @@ class AgentLoop:
                 time.sleep(poll_interval_seconds)
                 continue
 
-            if (
-                only_on_scene_change
-                and last_seen_world_version == current_world_version
-            ):
-                time.sleep(poll_interval_seconds)
-                continue
-
-            turn = self.step(scene_state, user_prompt=user_prompt)
+            turn = self.step(
+                scene_state,
+                user_prompt=user_prompt,
+                on_model_stdout=on_model_stdout,
+                on_model_stderr=on_model_stderr,
+            )
             steps += 1
-            last_seen_world_version = current_world_version
 
             if on_turn is not None:
                 on_turn(turn)

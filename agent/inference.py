@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, TextIO
 
 from agent.prompt_builder import PromptBundle
 
@@ -19,6 +21,8 @@ _QUANTIZATION_ALIASES = {
     "q4_k_m": "Q4_K_M",
     "q4_k_s": "Q4_K_S",
 }
+
+StreamChunkHandler = Callable[[str], None]
 
 
 def _extract_assistant_response(raw_stdout: str, prompt_text: str) -> str:
@@ -58,6 +62,27 @@ def _normalize_quantization(quantization: str) -> str:
     return normalized.upper()
 
 
+def _drain_text_stream(
+    stream: TextIO,
+    sink: list[str],
+    on_chunk: StreamChunkHandler | None,
+) -> None:
+    while True:
+        chunk = stream.read(1)
+        if chunk == "":
+            return
+
+        sink.append(chunk)
+
+        if on_chunk is None:
+            continue
+
+        try:
+            on_chunk(chunk)
+        except Exception:
+            on_chunk = None
+
+
 @dataclass(frozen=True)
 class LlamaCppConfig:
     hf_repo: str = "unsloth/Ministral-3-3B-Instruct-2512-GGUF"
@@ -91,7 +116,12 @@ class LlamaCppInference:
     def model_ref(self) -> str:
         return f"{self._config.hf_repo}:{self._quantization}"
 
-    def generate(self, prompt: PromptBundle) -> str:
+    def generate(
+        self,
+        prompt: PromptBundle,
+        on_stdout: StreamChunkHandler | None = None,
+        on_stderr: StreamChunkHandler | None = None,
+    ) -> str:
         command = [
             str(self._config.binary_path),
             "--hf-repo",
@@ -116,18 +146,64 @@ class LlamaCppInference:
             command.extend(["--threads", str(self._config.threads)])
 
         env = os.environ.copy()
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
-            check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
-            timeout=self._config.timeout_seconds,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
 
-        stdout = completed.stdout.decode("utf-8", errors="replace").strip()
-        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            raise RuntimeError("llama-cli did not expose stdout/stderr pipes")
 
-        if completed.returncode != 0:
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        stdout_thread = threading.Thread(
+            target=_drain_text_stream,
+            args=(process.stdout, stdout_chunks, on_stdout),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_drain_text_stream,
+            args=(process.stderr, stderr_chunks, on_stderr),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        try:
+            return_code = process.wait(timeout=self._config.timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            return_code = process.wait()
+            stdout_thread.join(timeout=1.0)
+            stderr_thread.join(timeout=1.0)
+            stdout = "".join(stdout_chunks).strip()
+            stderr = "".join(stderr_chunks).strip()
+            stderr_tail = stderr[-4000:] if len(stderr) > 4000 else stderr
+            stdout_tail = stdout[-1000:] if len(stdout) > 1000 else stdout
+            raise RuntimeError(
+                "llama-cli inference timed out "
+                f"(timeout={self._config.timeout_seconds}s, model={self.model_ref}, "
+                f"exit={return_code}). "
+                f"stderr={stderr_tail or '<empty>'} stdout={stdout_tail or '<empty>'}"
+            ) from exc
+        finally:
+            stdout_thread.join(timeout=1.0)
+            stderr_thread.join(timeout=1.0)
+            process.stdout.close()
+            process.stderr.close()
+
+        stdout = "".join(stdout_chunks).strip()
+        stderr = "".join(stderr_chunks).strip()
+
+        if return_code != 0:
             if "unknown model architecture: 'mistral3'" in stderr:
                 raise RuntimeError(
                     "llama-cli cannot load this model because your llama.cpp build "
@@ -140,7 +216,7 @@ class LlamaCppInference:
             stdout_tail = stdout[-1000:] if len(stdout) > 1000 else stdout
             raise RuntimeError(
                 "llama-cli inference failed "
-                f"(exit={completed.returncode}, model={self.model_ref}). "
+                f"(exit={return_code}, model={self.model_ref}). "
                 f"stderr={stderr_tail or '<empty>'} stdout={stdout_tail or '<empty>'}"
             )
 

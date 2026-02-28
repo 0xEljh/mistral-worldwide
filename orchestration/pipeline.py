@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import threading
 import time
 from typing import Any, cast
 
+from api.embedded_server import EmbeddedApiServer
 from agent.inference import LlamaCppConfig, LlamaCppInference
 from agent.loop import AgentLoop, AgentTurn
 from perception.frame_provider import FrameSourceMode
@@ -18,11 +20,19 @@ def _default_turn_handler(turn: AgentTurn) -> None:
     )
 
 
+def _streaming_turn_handler(turn: AgentTurn) -> None:
+    print(
+        f"\n[agent] world_version={turn.world_version} frame={turn.scene_timestamp}",
+        flush=True,
+    )
+
+
 def run_pipeline(
     user_prompt: str = "",
     quantization: str = "Q4_K_M",
     poll_interval_seconds: float = 1.0,
     max_steps: int | None = None,
+    stream_llm_output: bool = True,
     perception_startup_timeout_seconds: float = 5.0,
     camera_index: int = 0,
     display_perception: bool = True,
@@ -32,33 +42,83 @@ def run_pipeline(
     api_stale_after_seconds: float = 1.0,
     switch_to_api_after_consecutive: int = 5,
     switch_cooldown_seconds: float = 2.0,
+    api_ingest_host: str = "0.0.0.0",
+    api_ingest_port: int = 8000,
+    api_ingest_startup_timeout_seconds: float = 5.0,
 ) -> None:
     shared_state = WorldState()
     stop_event = threading.Event()
     failure_box: dict[str, Exception | None] = {"error": None}
-
-    def _perception_target() -> None:
-        try:
-            run_world_state_tracking_loop(
-                state=shared_state,
-                camera_index=camera_index,
-                model_path=model_path,
-                tracker_path=tracker_path,
-                display=display_perception,
-                stop_event=stop_event,
-                frame_source_mode=frame_source_mode,
-                api_stale_after_seconds=api_stale_after_seconds,
-                switch_to_api_after_consecutive=switch_to_api_after_consecutive,
-                switch_cooldown_seconds=switch_cooldown_seconds,
-            )
-        except Exception as exc:  # pragma: no cover - best effort crash forwarding
-            failure_box["error"] = exc
-
-    perception_thread = threading.Thread(target=_perception_target, daemon=True)
-    perception_thread.start()
+    embedded_api_server: EmbeddedApiServer | None = None
+    perception_thread: threading.Thread | None = None
 
     try:
-        startup_deadline = time.monotonic() + perception_startup_timeout_seconds
+        if frame_source_mode in {"auto", "api"}:
+            candidate_api_server = EmbeddedApiServer(
+                host=api_ingest_host,
+                port=api_ingest_port,
+            )
+            try:
+                websocket_url = candidate_api_server.start(
+                    startup_timeout_seconds=api_ingest_startup_timeout_seconds
+                )
+            except Exception as exc:
+                candidate_api_server.stop()
+                if frame_source_mode == "auto":
+                    print(
+                        "[api] Embedded ingest server unavailable in auto mode; "
+                        "continuing with local-only fallback. "
+                        f"Reason: {exc}"
+                    )
+                else:
+                    raise RuntimeError(
+                        "Failed to start embedded API ingest server in strict api mode. "
+                        "Use a free --api-ingest-port or stop conflicting servers."
+                    ) from exc
+            else:
+                embedded_api_server = candidate_api_server
+                print(f"[api] Embedded ingest server listening on {websocket_url}")
+
+        def _perception_target() -> None:
+            try:
+                run_world_state_tracking_loop(
+                    state=shared_state,
+                    camera_index=camera_index,
+                    model_path=model_path,
+                    tracker_path=tracker_path,
+                    display=display_perception,
+                    stop_event=stop_event,
+                    frame_source_mode=frame_source_mode,
+                    api_stale_after_seconds=api_stale_after_seconds,
+                    switch_to_api_after_consecutive=switch_to_api_after_consecutive,
+                    switch_cooldown_seconds=switch_cooldown_seconds,
+                )
+            except Exception as exc:  # pragma: no cover - best effort crash forwarding
+                failure_box["error"] = exc
+
+        perception_thread = threading.Thread(target=_perception_target, daemon=True)
+        perception_thread.start()
+
+        # When the embedded API server is running, frames only arrive once a
+        # remote client connects and starts streaming.  There is no way to know
+        # how long that will take, so we disable the startup deadline.  The
+        # perception loop already logs "Waiting for API frames..." periodically,
+        # giving the operator feedback.  In local-only mode (no embedded server)
+        # we keep the deadline so a missing camera fails fast.
+        if (
+            embedded_api_server is not None
+            or frame_source_mode == "api"
+            or perception_startup_timeout_seconds <= 0.0
+        ):
+            startup_deadline: float | None = None
+            if embedded_api_server is not None:
+                print(
+                    "[pipeline] Waiting for frames. "
+                    f"Stream to {embedded_api_server.websocket_url} to begin."
+                )
+        else:
+            startup_deadline = time.monotonic() + perception_startup_timeout_seconds
+
         while True:
             if failure_box["error"] is not None:
                 raise RuntimeError(
@@ -72,20 +132,37 @@ def run_pipeline(
             if shared_state.snapshot().get("timestamp", 0) > 0:
                 break
 
-            if time.monotonic() >= startup_deadline:
+            if startup_deadline is not None and time.monotonic() >= startup_deadline:
+                if embedded_api_server is not None:
+                    source_hint = (
+                        "Check local camera availability or stream frames to "
+                        f"{embedded_api_server.websocket_url}."
+                    )
+                else:
+                    source_hint = (
+                        "Check camera availability or pass a valid --camera-index."
+                    )
+
                 raise RuntimeError(
                     "Perception did not produce frames before startup timeout. "
-                    "Check camera availability or pass a valid --camera-index."
+                    + source_hint
                 )
 
             time.sleep(0.05)
 
+        print("[pipeline] Loading LLM inference engine...")
         inference = LlamaCppInference(
             LlamaCppConfig(
                 quantization=quantization,
             )
         )
         agent_loop = AgentLoop(inference=inference)
+
+        def _on_model_stdout(chunk: str) -> None:
+            print(chunk, end="", flush=True)
+
+        def _on_model_stderr(chunk: str) -> None:
+            print(chunk, end="", flush=True, file=sys.stderr)
 
         def _state_provider() -> dict[str, Any]:
             if failure_box["error"] is not None:
@@ -100,14 +177,20 @@ def run_pipeline(
             state_provider=_state_provider,
             user_prompt=user_prompt,
             poll_interval_seconds=poll_interval_seconds,
-            only_on_scene_change=True,
             require_initialized_state=False,
             max_steps=max_steps,
-            on_turn=_default_turn_handler,
+            on_turn=(
+                _streaming_turn_handler if stream_llm_output else _default_turn_handler
+            ),
+            on_model_stdout=_on_model_stdout if stream_llm_output else None,
+            on_model_stderr=_on_model_stderr if stream_llm_output else None,
         )
     finally:
         stop_event.set()
-        perception_thread.join(timeout=5.0)
+        if perception_thread is not None:
+            perception_thread.join(timeout=5.0)
+        if embedded_api_server is not None:
+            embedded_api_server.stop()
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -133,10 +216,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Optional max number of agent turns",
     )
     parser.add_argument(
+        "--no-stream-llm-output",
+        action="store_true",
+        help="Disable live LLM stdout/stderr streaming and print one response per turn.",
+    )
+    parser.add_argument(
         "--perception-startup-timeout-seconds",
         type=float,
         default=5.0,
-        help="How long to wait for first perception frame before failing",
+        help="How long to wait for first perception frame before failing (<=0 disables)",
     )
     parser.add_argument(
         "--camera-index", type=int, default=0, help="OpenCV camera index"
@@ -177,6 +265,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Minimum time between source switches in auto mode.",
     )
+    parser.add_argument(
+        "--api-ingest-host",
+        default="0.0.0.0",
+        help="Host for embedded API ingest server (used in auto/api modes).",
+    )
+    parser.add_argument(
+        "--api-ingest-port",
+        type=int,
+        default=8000,
+        help="Port for embedded API ingest server (used in auto/api modes).",
+    )
+    parser.add_argument(
+        "--api-ingest-startup-timeout-seconds",
+        type=float,
+        default=5.0,
+        help="How long to wait for embedded API ingest server startup.",
+    )
     return parser
 
 
@@ -189,6 +294,7 @@ def main() -> None:
         quantization=args.quantization,
         poll_interval_seconds=args.poll_interval_seconds,
         max_steps=args.max_steps,
+        stream_llm_output=not args.no_stream_llm_output,
         perception_startup_timeout_seconds=args.perception_startup_timeout_seconds,
         camera_index=args.camera_index,
         display_perception=not args.no_display_perception,
@@ -198,6 +304,9 @@ def main() -> None:
         api_stale_after_seconds=args.api_stale_after_seconds,
         switch_to_api_after_consecutive=args.switch_to_api_after_consecutive,
         switch_cooldown_seconds=args.switch_cooldown_seconds,
+        api_ingest_host=args.api_ingest_host,
+        api_ingest_port=args.api_ingest_port,
+        api_ingest_startup_timeout_seconds=args.api_ingest_startup_timeout_seconds,
     )
 
 
