@@ -17,3 +17,8 @@ venv/
 .ruff_cache/
 
 llama.cpp/*
+
+artifacts/*
+
+*.jpg
+
