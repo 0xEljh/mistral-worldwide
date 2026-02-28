@@ -3,7 +3,7 @@ name = "mistral-worldwide"
 version = "0.1.0"
 description = "Mistral Worldwide API and utilities"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi",
     "uvicorn",
@@ -14,6 +14,9 @@ dependencies = [
     "opencv-python",
     "pillow",
     "ultralytics",
+    "torch>=2.4",
+    "transformers>=4.40",
+    "vllm>=0.16.0",
 ]
 
 [build-system]
@@ -23,3 +26,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["routes"]
 include = ["main.py"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
