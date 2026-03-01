@@ -31,7 +31,7 @@ MAX_EVENTS = 20
 DISAPPEARANCE_THRESHOLD = 15
 IDLE_SLEEP_SECONDS = 0.01
 WAIT_LOG_INTERVAL_SECONDS = 2.0
-CROP_BUFFER = 10
+CROP_BUFFER = 20
 
 DIRECTION_MAPPING = {
     -4: "left",
@@ -124,9 +124,9 @@ class WorldState:
                                 / math.pi
                             )
                         ]
-                        self.events.append(f"{obj.type}_{track_id} moved {direction}")
+                        self.events.append(f"{obj.type}_{track_id} moved {direction}" + f" at frame {self.frame_index}")
                     elif prev_moving_state and not obj.moving:
-                        self.events.append(f"{obj.type}_{track_id} stopped")
+                        self.events.append(f"{obj.type}_{track_id} stopped" + f" at frame {self.frame_index}")
                 else:
                     self.objects[track_id] = WorldObject(
                         track_id,
@@ -136,7 +136,7 @@ class WorldState:
                         self.frame_index,
                         xyxy,
                     )
-                    self.events.append(f"{class_name}_{track_id} appeared")
+                    self.events.append(f"{class_name}_{track_id} appeared" + f" at frame {self.frame_index}")
 
             for track_id, obj in self.objects.items():
                 is_missing = track_id not in seen_ids
@@ -148,7 +148,7 @@ class WorldState:
                     and obj.visible
                 ):
                     obj.mark_missing()
-                    self.events.append(f"{obj.type}_{track_id} disappeared")
+                    self.events.append(f"{obj.type}_{track_id} disappeared" + f" at frame {self.frame_index}")
 
             self._update_relations_delta(seen_ids)
 
