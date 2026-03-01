@@ -1,8 +1,8 @@
-# Mistral Worldwide
+# Worldstate Embodied AI
 
-An embodied AI agent that perceives the real world through a webcam, builds a persistent structured scene memory, and reasons about what it sees using a local LLM — all running on-device.
+A proof-of-concept framework for embodied AI agent that perceives the real world through a webcam and builds a persistent structured scene memory, and reasons about what it sees using a local LLM — all running on-device.
 
-Mistral Worldwide connects real-time computer vision (YOLOv26x + BoT-SORT tracking) to a local language model (Ministral 3B via llama.cpp) through a novel world-state graph and dual-store memory system. The agent can detect objects, track their motion, remember what it has seen, answer questions about the scene, and narrate events as they happen — with optional voice I/O via ElevenLabs.
+Worldstate Embodied AI connects real-time computer vision (YOLOv26x + BoT-SORT tracking) to a local language model (Ministral 3B via llama.cpp) through a novel world-state graph and dual-store memory system. The agent can detect objects, track their motion, remember what it has seen, answer questions about the scene, and narrate events as they happen — with optional voice I/O via ElevenLabs.
 
 ## Architecture
 
@@ -71,16 +71,16 @@ flowchart LR
 
 Each tracked detection becomes a `WorldObject` with:
 
-| Field | Description |
-|---|---|
-| `track_id` | Persistent ID from BoT-SORT (survives occlusion) |
-| `type` | Class label from YOLO (e.g. `person`, `cell phone`) |
-| `center` | Bounding box centroid `(x, y)` |
-| `velocity` | Per-frame displacement `(vx, vy)` |
-| `moving` | Boolean motion state with hysteresis |
-| `visible` | Whether the object is currently detected |
-| `confidence` | YOLO detection confidence |
-| `first_seen` / `last_seen` | Frame lifecycle timestamps |
+| Field                      | Description                                         |
+| -------------------------- | --------------------------------------------------- |
+| `track_id`                 | Persistent ID from BoT-SORT (survives occlusion)    |
+| `type`                     | Class label from YOLO (e.g. `person`, `cell phone`) |
+| `center`                   | Bounding box centroid `(x, y)`                      |
+| `velocity`                 | Per-frame displacement `(vx, vy)`                   |
+| `moving`                   | Boolean motion state with hysteresis                |
+| `visible`                  | Whether the object is currently detected            |
+| `confidence`               | YOLO detection confidence                           |
+| `first_seen` / `last_seen` | Frame lifecycle timestamps                          |
 
 **Motion detection** uses hysteresis to avoid flicker: an object is declared "moving" only after `MOTION_START_CONTINUOUS_FRAME_THRESHOLD` (4) consecutive frames above the speed threshold, and "stopped" only after `MOTION_STOP_CONTINUOUS_FRAME_THRESHOLD` (4) consecutive frames below it. This prevents noisy detections from generating spurious motion events.
 
@@ -116,14 +116,14 @@ The `critical` flag signals the agent loop that an event warrants an unprompted 
   "critical": false,
   "world_version": 1042,
   "timestamp": 3150,
-  "frame_size": {"width": 1920, "height": 1080},
+  "frame_size": { "width": 1920, "height": 1080 },
   "objects": [
     {
       "id": 1,
       "type": "person",
-      "position": {"x": 540, "y": 320},
-      "velocity": {"x": -3, "y": 0},
-      "state": {"visible": true, "moving": true},
+      "position": { "x": 540, "y": 320 },
+      "velocity": { "x": -3, "y": 0 },
+      "state": { "visible": true, "moving": true },
       "confidence": 0.9214,
       "first_seen": 10,
       "last_seen": 3150
@@ -165,14 +165,14 @@ The graph history store saves periodic snapshots of the world graph (every N wor
 
 **Snapshot scoring** combines four weighted components:
 
-| Component | What it measures | Intuition |
-|---|---|---|
-| Age score | Exponential decay from current time | Recent snapshots are more relevant |
-| Visible entity count | Ratio of visible entities to a reference count | Busier scenes carry more information |
-| Description length RMS | RMS of text description lengths for visible entities | Richly-described scenes are more valuable |
+| Component                | What it measures                                       | Intuition                                    |
+| ------------------------ | ------------------------------------------------------ | -------------------------------------------- |
+| Age score                | Exponential decay from current time                    | Recent snapshots are more relevant           |
+| Visible entity count     | Ratio of visible entities to a reference count         | Busier scenes carry more information         |
+| Description length RMS   | RMS of text description lengths for visible entities   | Richly-described scenes are more valuable    |
 | Entity time-in-frame RMS | RMS of `(last_seen - first_seen)` for visible entities | Longer-tracked entities are more established |
 
-**Stochastic eviction**: Rather than deterministically evicting the lowest-scored snapshot, the store uses inverse-score weighted random selection (`weight = 1 / (score + epsilon)`). This means low-scoring snapshots are *likely* to be evicted but not *guaranteed* — preserving temporal diversity and preventing the history from clustering around only the most "interesting" moments.
+**Stochastic eviction**: Rather than deterministically evicting the lowest-scored snapshot, the store uses inverse-score weighted random selection (`weight = 1 / (score + epsilon)`). This means low-scoring snapshots are _likely_ to be evicted but not _guaranteed_ — preserving temporal diversity and preventing the history from clustering around only the most "interesting" moments.
 
 **Protected recent snapshots**: The N most recent snapshots (configurable) are excluded from eviction candidates, ensuring the agent always has access to recent context regardless of score.
 
@@ -327,6 +327,7 @@ uv run python -m orchestration.pipeline --quantization Q4_K_M --interactive-user
 ```
 
 Features:
+
 - Real-time streaming transcript of agent responses
 - Status bar showing world version, frame count, and frame source
 - Text input for questions about the scene
@@ -349,31 +350,31 @@ In `auto` mode (default), the pipeline prefers API frames when available and fal
 
 ## CLI Reference
 
-| Flag | Default | Description |
-|---|---|---|
-| `--quantization` | `Q4_K_M` | GGUF quantization variant (`Q4_K_M`, `Q2_K`, etc.) |
-| `--max-steps` | unlimited | Stop after N agent turns |
-| `--user-prompt "..."` | none | Standing user instruction appended to every prompt |
-| `--interactive-user-input` | off | Launch the Textual conversation TUI |
-| `--interactive-history-window-turns` | `6` | Number of prior turns retained in context |
-| `--interactive-status-refresh-interval-seconds` | `1.0` | TUI status bar refresh cadence |
-| `--interactive-transcript-max-lines` | `2000` | Max transcript lines in TUI |
-| `--interactive-log-file` | `artifacts/logs/interactive-<ts>.log` | TUI diagnostics log file |
-| `--poll-interval-seconds` | `1.0` | Agent loop polling interval |
-| `--perception-startup-timeout-seconds` | `5.0` | Fail fast if no camera frames arrive |
-| `--camera-index` | `0` | OpenCV camera index |
-| `--no-display-perception` | off | Run without the OpenCV display window |
-| `--frame-source-mode` | `auto` | Frame source: `auto`, `api`, or `local` |
-| `--api-ingest-host` / `--api-ingest-port` | `127.0.0.1:8000` | Embedded websocket ingest bind address |
-| `--llm-gpu-layers` | `auto` | llama.cpp GPU layer offload count |
-| `--llm-cpu-only` | off | Force CPU inference |
-| `--no-llm-cpu-fallback` | off | Fail fast if GPU startup fails |
-| `--graph-snapshot-interval` | `1000` | Save world-graph PNG every N versions (`0` disables) |
+| Flag                                            | Default                               | Description                                          |
+| ----------------------------------------------- | ------------------------------------- | ---------------------------------------------------- |
+| `--quantization`                                | `Q4_K_M`                              | GGUF quantization variant (`Q4_K_M`, `Q2_K`, etc.)   |
+| `--max-steps`                                   | unlimited                             | Stop after N agent turns                             |
+| `--user-prompt "..."`                           | none                                  | Standing user instruction appended to every prompt   |
+| `--interactive-user-input`                      | off                                   | Launch the Textual conversation TUI                  |
+| `--interactive-history-window-turns`            | `6`                                   | Number of prior turns retained in context            |
+| `--interactive-status-refresh-interval-seconds` | `1.0`                                 | TUI status bar refresh cadence                       |
+| `--interactive-transcript-max-lines`            | `2000`                                | Max transcript lines in TUI                          |
+| `--interactive-log-file`                        | `artifacts/logs/interactive-<ts>.log` | TUI diagnostics log file                             |
+| `--poll-interval-seconds`                       | `1.0`                                 | Agent loop polling interval                          |
+| `--perception-startup-timeout-seconds`          | `5.0`                                 | Fail fast if no camera frames arrive                 |
+| `--camera-index`                                | `0`                                   | OpenCV camera index                                  |
+| `--no-display-perception`                       | off                                   | Run without the OpenCV display window                |
+| `--frame-source-mode`                           | `auto`                                | Frame source: `auto`, `api`, or `local`              |
+| `--api-ingest-host` / `--api-ingest-port`       | `127.0.0.1:8000`                      | Embedded websocket ingest bind address               |
+| `--llm-gpu-layers`                              | `auto`                                | llama.cpp GPU layer offload count                    |
+| `--llm-cpu-only`                                | off                                   | Force CPU inference                                  |
+| `--no-llm-cpu-fallback`                         | off                                   | Fail fast if GPU startup fails                       |
+| `--graph-snapshot-interval`                     | `1000`                                | Save world-graph PNG every N versions (`0` disables) |
 
 ## Project Structure
 
 ```
-mistral-worldwide/
+worldstate-ai/
   perception/            # Computer vision pipeline
     yoloworldstate.py    #   WorldState scene graph, WorldObject, Relation
     frame_provider.py    #   Lock-free frame sharing singleton, source selection
