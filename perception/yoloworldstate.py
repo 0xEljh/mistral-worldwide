@@ -107,11 +107,11 @@ class WorldState:
                 self.crops[track_id] = crop
 
                 center = (
-                    (boxes.xyxy[i, 0] + boxes.xyxy[i, 2]).item() / 2,
-                    (boxes.xyxy[i, 1] + boxes.xyxy[i, 3]).item() / 2,
+                    round((boxes.xyxy[i, 0] + boxes.xyxy[i, 2]).item() / 2),
+                    round((boxes.xyxy[i, 1] + boxes.xyxy[i, 3]).item() / 2),
                 )
                 class_name = names[boxes.cls[i].int().item()]
-                conf = boxes.conf[i].item()
+                conf = round(boxes.conf[i].item(),4)
 
                 if track_id in self.objects:
                     obj = self.objects[track_id]
