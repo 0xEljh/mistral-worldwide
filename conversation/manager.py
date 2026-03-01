@@ -17,6 +17,7 @@ TurnStartCallback = Callable[["ConversationTrigger", SceneState], None]
 TurnCompleteCallback = Callable[["ConversationTrigger", AgentTurn], None]
 TriggerCallback = Callable[["ConversationTrigger"], None]
 MessageCallback = Callable[[str], None]
+ToolCallCallback = Callable[[str, str, str], None]
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class ConversationManager:
         self.on_turn_complete: TurnCompleteCallback | None = None
         self.on_notice: MessageCallback | None = None
         self.on_error: MessageCallback | None = None
+        self.on_tool_call: ToolCallCallback | None = None
 
     @property
     def turns_completed(self) -> int:
@@ -246,6 +248,7 @@ class ConversationManager:
                 self._on_model_stdout_chunk if self._stream_llm_output else None
             ),
             on_model_stderr=self._on_model_stderr_chunk,
+            on_tool_call=self._emit_tool_call_threadsafe,
         )
 
     def _history_for_prompt(self) -> list[dict[str, str]]:
@@ -326,6 +329,30 @@ class ConversationManager:
         callback = self.on_turn_complete
         if callback is not None:
             self._safe_callback(callback, trigger, turn)
+
+    def _emit_tool_call_threadsafe(
+        self,
+        tool_name: str,
+        arguments: str,
+        result: str,
+    ) -> None:
+        callback = self.on_tool_call
+        if callback is None:
+            return
+
+        loop = self._loop
+        if loop is None:
+            self._safe_callback(callback, tool_name, arguments, result)
+            return
+
+        self._call_soon_threadsafe(
+            loop,
+            self._safe_callback,
+            callback,
+            tool_name,
+            arguments,
+            result,
+        )
 
     def _emit_notice(self, message: str) -> None:
         callback = self.on_notice

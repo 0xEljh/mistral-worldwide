@@ -116,7 +116,7 @@ class WorldState:
                     round((boxes.xyxy[i, 1] + boxes.xyxy[i, 3]).item() / 2),
                 )
                 class_name = names[boxes.cls[i].int().item()]
-                conf = round(boxes.conf[i].item(),4)
+                conf = round(boxes.conf[i].item(), 4)
 
                 if track_id in self.objects:
                     obj = self.objects[track_id]
@@ -131,7 +131,7 @@ class WorldState:
                                 / math.pi
                             )
                         ]
-                        self.critical = True
+                        # self.critical = True
                         self.events.append(
                             f"{obj.type}_{track_id} moved {direction}"
                             + f" at frame {self.frame_index}"
@@ -150,7 +150,7 @@ class WorldState:
                         self.frame_index,
                         xyxy,
                     )
-                    self.critical = True
+                    # self.critical = True
                     self.events.append(
                         f"{class_name}_{track_id} appeared"
                         + f" at frame {self.frame_index}"

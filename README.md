@@ -90,6 +90,20 @@ uv run python -m orchestration.pipeline --quantization Q4_K_M
 
 Press `q` in the OpenCV window to stop.
 
+### 5) Run interactive TUI mode
+
+```bash
+uv run python -m orchestration.pipeline --quantization Q4_K_M --interactive-user-input
+```
+
+In interactive mode:
+
+- Type a message and press Enter to submit.
+- Keep typing while model output streams in the transcript.
+- Critical vision events can trigger assistant turns without user input.
+- Use `Ctrl+C`, or type `exit` / `quit`, to close the app.
+- Use `Ctrl+L` to clear the transcript panel.
+
 ### Useful flags
 
 - `--quantization Q4_K_M`: default 4-bit quantized model.
@@ -98,12 +112,18 @@ Press `q` in the OpenCV window to stop.
 - `--llm-cpu-only`: force CPU inference (no GPU offload).
 - `--no-llm-cpu-fallback`: fail fast if GPU startup fails instead of retrying on CPU.
 - `--user-prompt "..."`: optional user instruction appended to scene-memory prompt.
+- `--interactive-user-input`: launch the Textual conversation TUI.
+- `--interactive-history-window-turns 6`: number of prior user/assistant turns to retain in context (interactive mode).
+- `--interactive-status-refresh-interval-seconds 1.0`: refresh cadence for frame/version counters in the TUI status bar.
+- `--interactive-transcript-max-lines 2000`: cap transcript history retained in the TUI.
+- `--interactive-log-file /path/to/interactive.log`: optional log file for interactive-mode diagnostics (defaults to `artifacts/logs/interactive-<timestamp>.log`).
 - `--poll-interval-seconds 1.0`: how often the agent loop checks for updates.
 - `--perception-startup-timeout-seconds 5.0`: fail fast if no camera frames arrive.
 - `--camera-index 0`: select webcam index.
 - `--no-display-perception`: run without the OpenCV display window.
 - `--frame-source-mode auto|api|local`: source selection (`auto` prefers API, falls back local).
 - `--api-ingest-host` / `--api-ingest-port`: embedded websocket ingest bind address for API frames.
+- `--graph-snapshot-interval 1000`: save world-graph PNG snapshots every N world versions (`0` disables) to `artifacts/graphs/<run-id>/`.
 
 ### API frame ingest (same-process)
 

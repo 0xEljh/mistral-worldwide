@@ -23,6 +23,7 @@ def _log_supports_wrap_parameter() -> bool:
 
 class InteractiveConversationApp(App[None]):
     CSS_PATH = "styles.tcss"
+    TOOL_LOG_PREVIEW_LIMIT = 200
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+l", "clear_transcript", "Clear"),
@@ -81,6 +82,7 @@ class InteractiveConversationApp(App[None]):
         self._conversation_manager.on_turn_complete = self._on_turn_complete
         self._conversation_manager.on_notice = self._on_notice
         self._conversation_manager.on_error = self._on_error
+        self._conversation_manager.on_tool_call = self._on_tool_call
 
         self._manager_task = asyncio.create_task(self._conversation_manager.run())
         self._manager_task.add_done_callback(self._on_manager_task_done)
@@ -262,8 +264,29 @@ class InteractiveConversationApp(App[None]):
             self._event_logger.error("Conversation error callback: %s", message)
         self._write_line(f"[error] {message}")
 
+    def _on_tool_call(self, tool_name: str, arguments: str, result: str) -> None:
+        if self._closing:
+            return
+
+        argument_preview = self._truncate_tool_log_value(arguments)
+        result_preview = self._truncate_tool_log_value(result)
+        self._write_line(
+            f"[tool] {tool_name} args={argument_preview} result={result_preview}"
+        )
+
     def _write_user_line(self, text: str) -> None:
         self._write_line(f"[user] {text}")
+
+    def _truncate_tool_log_value(self, value: str) -> str:
+        single_line = str(value).strip().replace("\r", "\\r").replace("\n", "\\n")
+        if len(single_line) <= self.TOOL_LOG_PREVIEW_LIMIT:
+            return single_line
+
+        if self.TOOL_LOG_PREVIEW_LIMIT <= 3:
+            return "..."
+
+        cutoff = self.TOOL_LOG_PREVIEW_LIMIT - 3
+        return f"{single_line[:cutoff]}..."
 
     def _write_line(self, text: str) -> None:
         if self._closing:

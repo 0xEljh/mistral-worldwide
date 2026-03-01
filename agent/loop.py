@@ -12,6 +12,7 @@ AuxiliaryContext = Mapping[str, Any]
 AuxiliaryContextProvider = Callable[[], AuxiliaryContext]
 PromptBuilder = Callable[..., PromptBundle]
 StreamChunkHandler = Callable[[str], None]
+ToolCallHandler = Callable[[str, str, str], None]
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class AgentLoop:
         conversation_history: list[Mapping[str, Any]] | None = None,
         on_model_stdout: StreamChunkHandler | None = None,
         on_model_stderr: StreamChunkHandler | None = None,
+        on_tool_call: ToolCallHandler | None = None,
     ) -> AgentTurn:
         prompt = self._prompt_builder(
             scene_state,
@@ -55,6 +57,7 @@ class AgentLoop:
             prompt,
             on_model_stdout=on_model_stdout,
             on_model_stderr=on_model_stderr,
+            on_tool_call=on_tool_call,
         )
 
         return AgentTurn(
@@ -70,6 +73,7 @@ class AgentLoop:
         *,
         on_model_stdout: StreamChunkHandler | None,
         on_model_stderr: StreamChunkHandler | None,
+        on_tool_call: ToolCallHandler | None,
     ) -> str:
         if (
             self._tool_dispatcher is None
@@ -123,6 +127,8 @@ class AgentLoop:
                 tool_call.name,
                 tool_call.arguments,
             )
+            if on_tool_call is not None:
+                on_tool_call(tool_call.name, tool_call.arguments, tool_output)
             tool_messages.append(
                 {
                     "role": "tool",
