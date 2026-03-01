@@ -76,6 +76,7 @@ class WorldState:
     """
 
     def __init__(self, max_events: int = MAX_EVENTS):
+        self.critical = False
         self.objects: dict[int, WorldObject] = {}
         self.crops = {}
         self.relations: dict[
@@ -89,6 +90,7 @@ class WorldState:
 
     def update_from_detections(self, frame, names, boxes) -> None:
         with self._lock:
+            self.critical = False
             self.frame_index += 1
             if boxes.id is None:
                 return
@@ -124,6 +126,7 @@ class WorldState:
                                 / math.pi
                             )
                         ]
+                        self.critical = True
                         self.events.append(f"{obj.type}_{track_id} moved {direction}" + f" at frame {self.frame_index}")
                     elif prev_moving_state and not obj.moving:
                         self.events.append(f"{obj.type}_{track_id} stopped" + f" at frame {self.frame_index}")
@@ -136,6 +139,7 @@ class WorldState:
                         self.frame_index,
                         xyxy,
                     )
+                    self.critical = True
                     self.events.append(f"{class_name}_{track_id} appeared" + f" at frame {self.frame_index}")
 
             for track_id, obj in self.objects.items():
@@ -148,6 +152,7 @@ class WorldState:
                     and obj.visible
                 ):
                     obj.mark_missing()
+                    self.critical = True
                     self.events.append(f"{obj.type}_{track_id} disappeared" + f" at frame {self.frame_index}")
 
             self._update_relations_delta(seen_ids)
