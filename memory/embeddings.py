@@ -11,8 +11,14 @@ DEFAULT_EMBEDDING_MODEL_NAME = "unsloth/all-MiniLM-L6-v2"
 class EmbeddingModel:
     """Lazy sentence-transformer embedding wrapper."""
 
-    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL_NAME) -> None:
+    def __init__(
+        self,
+        model_name: str = DEFAULT_EMBEDDING_MODEL_NAME,
+        *,
+        offline: bool = False,
+    ) -> None:
         self._model_name = model_name
+        self._offline = offline
         self._model: Any | None = None
         self._dimension: int | None = None
         self._lock = threading.Lock()
@@ -26,7 +32,7 @@ class EmbeddingModel:
         if self._dimension is not None:
             return self._dimension
         model = self._ensure_model()
-        self._dimension = int(model.get_sentence_embedding_dimension())
+        self._dimension = self._resolve_dimension(model)
         return self._dimension
 
     def encode(self, text: str) -> np.ndarray:
@@ -77,7 +83,17 @@ class EmbeddingModel:
                     "Install project dependencies to enable embeddings."
                 ) from exc
 
-            model = SentenceTransformer(self._model_name)
+            model = SentenceTransformer(
+                self._model_name,
+                local_files_only=self._offline,
+            )
             self._model = model
-            self._dimension = int(model.get_sentence_embedding_dimension())
+            self._dimension = self._resolve_dimension(model)
             return model
+
+    @staticmethod
+    def _resolve_dimension(model: Any) -> int:
+        raw_dimension = model.get_sentence_embedding_dimension()
+        if raw_dimension is None:
+            raise RuntimeError("Embedding model did not report a dimension")
+        return int(raw_dimension)

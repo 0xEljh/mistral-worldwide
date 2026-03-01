@@ -13,6 +13,8 @@ Screen {
     height: 1fr;
     margin: 0 1;
     border: round $accent;
+    overflow-x: hidden;
+    overflow-y: auto;
 }
 
 #prompt-input {

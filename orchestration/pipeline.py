@@ -15,6 +15,7 @@ from agent.loop import AgentLoop, AgentTurn
 from agent.tools import TOOL_SCHEMAS, ToolDispatcher
 from memory import EmbeddingModel, GraphHistoryStore, MemoryRetriever, SemanticIndex
 from observability.vizgraph import GraphSnapshotRecorder
+from orchestration.aux_context import _build_auxiliary_context_with_fallback
 from perception.frame_provider import FrameSourceMode
 from perception.yoloworldstate import WorldState, run_world_state_tracking_loop
 
@@ -31,28 +32,6 @@ def _streaming_turn_handler(turn: AgentTurn) -> None:
         f"\n[agent] world_version={turn.world_version} frame={turn.scene_timestamp}",
         flush=True,
     )
-
-
-def _extract_visible_track_ids(scene_state: Mapping[str, Any]) -> set[int]:
-    objects = scene_state.get("objects")
-    if not isinstance(objects, list):
-        return set()
-
-    visible_track_ids: set[int] = set()
-    for object_entry in objects:
-        if not isinstance(object_entry, Mapping):
-            continue
-
-        raw_track_id = object_entry.get("id")
-        if raw_track_id is None:
-            continue
-
-        try:
-            visible_track_ids.add(int(raw_track_id))
-        except (TypeError, ValueError):
-            continue
-
-    return visible_track_ids
 
 
 def _is_indexable_description(text: str) -> bool:
@@ -132,6 +111,7 @@ def run_pipeline(
     graph_history_interval_world_versions: int = 200,
     graph_history_max_snapshots: int = 50,
     graph_snapshot_interval: int = 1000,
+    offline: bool = False,
 ) -> None:
     if graph_snapshot_interval < 0:
         raise ValueError("graph_snapshot_interval must be >= 0")
@@ -150,7 +130,7 @@ def run_pipeline(
 
     shared_state = WorldState()
     crop_description_store = CropDescriptionStore()
-    embedding_model = EmbeddingModel()
+    embedding_model = EmbeddingModel(offline=offline)
     semantic_index = SemanticIndex(embedding_model)
     graph_history_store = GraphHistoryStore(
         save_interval_world_versions=graph_history_interval_world_versions,
@@ -189,6 +169,8 @@ def run_pipeline(
         f"graph_history every {graph_history_interval_world_versions} versions, "
         f"max {graph_history_max_snapshots} snapshots)"
     )
+    if offline:
+        print("[pipeline] Offline mode enabled (cache-only model loading).")
 
     try:
         graph_snapshot_error_reported = False
@@ -373,6 +355,7 @@ def run_pipeline(
                 gpu_layers=llm_gpu_layers,
                 cpu_only=llm_cpu_only,
                 cpu_fallback=llm_cpu_fallback,
+                offline=offline,
             )
         )
         inference.start(
@@ -480,6 +463,11 @@ def run_pipeline(
                     described_at=described_at,
                 )
 
+        memory_warning_state: dict[str, bool] = {}
+
+        def _report_memory_warning(message: str) -> None:
+            print(message)
+
         def _build_auxiliary_context(
             *,
             scene_state: Mapping[str, Any],
@@ -487,29 +475,23 @@ def run_pipeline(
         ) -> dict[str, Any]:
             descriptions_snapshot = crop_description_store.snapshot()
             world_version = int(scene_state.get("world_version", 0))
-            _index_new_descriptions(
-                descriptions_snapshot,
-                world_version=world_version,
-            )
 
-            visible_track_ids = _extract_visible_track_ids(scene_state)
-            entity_memory_context = memory_retriever.all_entity_memory_context(
-                current_visible_track_ids=visible_track_ids,
-            )
-
-            context: dict[str, Any] = {
-                "object_descriptions": descriptions_snapshot,
-                "entity_memory": entity_memory_context,
-            }
-
-            if query_text.strip():
-                context["semantic_entity_matches"] = memory_retriever.query_context(
-                    query_text,
-                    top_k=semantic_search_top_k,
-                    current_visible_track_ids=visible_track_ids,
+            def _index_descriptions() -> None:
+                _index_new_descriptions(
+                    descriptions_snapshot,
+                    world_version=world_version,
                 )
 
-            return context
+            return _build_auxiliary_context_with_fallback(
+                scene_state=scene_state,
+                query_text=query_text,
+                descriptions_snapshot=descriptions_snapshot,
+                memory_retriever=memory_retriever,
+                semantic_search_top_k=semantic_search_top_k,
+                index_descriptions=_index_descriptions,
+                warning_state=memory_warning_state,
+                warning_reporter=_report_memory_warning,
+            )
 
         def _state_provider() -> dict[str, Any]:
             nonlocal latest_scene_state
@@ -645,6 +627,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--no-llm-cpu-fallback",
         action="store_true",
         help="Disable automatic CPU fallback if GPU startup fails.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use cache-only model loading and disable Hugging Face downloads.",
     )
     parser.add_argument(
         "--poll-interval-seconds",
@@ -829,6 +816,7 @@ def main() -> None:
             llm_gpu_layers=args.llm_gpu_layers,
             llm_cpu_only=args.llm_cpu_only,
             llm_cpu_fallback=not args.no_llm_cpu_fallback,
+            offline=args.offline,
             graph_history_interval_world_versions=(
                 args.graph_history_interval_world_versions
             ),

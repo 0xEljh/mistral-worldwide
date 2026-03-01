@@ -113,6 +113,7 @@ class LlamaCppConfig:
     temperature: float = 0.2
     threads: int | None = None
     timeout_seconds: float = 120.0
+    offline: bool = False
     binary_path: Path = _DEFAULT_LLAMA_CLI_PATH
 
 
@@ -131,6 +132,7 @@ class LlamaCppServerConfig:
     gpu_layers: str = "auto"
     cpu_only: bool = False
     cpu_fallback: bool = True
+    offline: bool = False
     binary_path: Path = _DEFAULT_LLAMA_SERVER_PATH
 
 
@@ -180,6 +182,9 @@ class LlamaCppInference:
             "--prompt",
             prompt.user_prompt,
         ]
+
+        if self._config.offline:
+            command.append("--offline")
 
         if self._config.threads is not None:
             command.extend(["--threads", str(self._config.threads)])
@@ -396,6 +401,9 @@ class LlamaCppServerInference:
             "--port",
             str(self._config.port),
         ]
+
+        if self._config.offline:
+            command.append("--offline")
 
         if cpu_only:
             command.extend(["--device", "none", "--n-gpu-layers", "0"])
