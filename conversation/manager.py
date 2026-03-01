@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ class ConversationManager:
         history_window_turns: int = 6,
         max_steps: int | None = None,
         stream_llm_output: bool = True,
+        logger: logging.Logger | None = None,
     ) -> None:
         if history_window_turns <= 0:
             raise ValueError("history_window_turns must be > 0")
@@ -49,6 +51,7 @@ class ConversationManager:
         self._history_window_turns = history_window_turns
         self._max_steps = max_steps
         self._stream_llm_output = stream_llm_output
+        self._logger = logger
 
         self._user_queue: asyncio.Queue[ConversationTrigger] = asyncio.Queue()
         self._vision_lock = threading.Lock()
@@ -131,6 +134,7 @@ class ConversationManager:
 
         self._loop = asyncio.get_running_loop()
         self._wake_event = asyncio.Event()
+        self._log_info("ConversationManager loop started")
 
         try:
             while not self._stop_requested:
@@ -148,6 +152,7 @@ class ConversationManager:
 
                 await self._run_turn(trigger)
         finally:
+            self._log_info("ConversationManager loop stopped")
             self._loop = None
             self._wake_event = None
 
@@ -205,6 +210,7 @@ class ConversationManager:
                 history_messages,
             )
         except Exception as exc:
+            self._log_exception("Failed to run conversation turn", exc)
             self._emit_error(f"Failed to run conversation turn: {exc}")
             return
         finally:
@@ -268,7 +274,7 @@ class ConversationManager:
         wake_event = self._wake_event
         if loop is None or wake_event is None:
             return
-        loop.call_soon_threadsafe(wake_event.set)
+        self._call_soon_threadsafe(loop, wake_event.set)
 
     def _emit_vision_trigger(self, trigger: ConversationTrigger) -> None:
         callback = self.on_vision_trigger
@@ -289,7 +295,13 @@ class ConversationManager:
             self._safe_callback(callback, trigger, scene_state)
             return
 
-        loop.call_soon_threadsafe(self._safe_callback, callback, trigger, scene_state)
+        self._call_soon_threadsafe(
+            loop,
+            self._safe_callback,
+            callback,
+            trigger,
+            scene_state,
+        )
 
     def _emit_turn_chunk_threadsafe(self, chunk: str) -> None:
         callback = self.on_turn_chunk
@@ -301,7 +313,12 @@ class ConversationManager:
             self._safe_callback(callback, chunk)
             return
 
-        loop.call_soon_threadsafe(self._safe_callback, callback, chunk)
+        self._call_soon_threadsafe(
+            loop,
+            self._safe_callback,
+            callback,
+            chunk,
+        )
 
     def _emit_turn_complete(
         self, trigger: ConversationTrigger, turn: AgentTurn
@@ -330,11 +347,45 @@ class ConversationManager:
             self._safe_callback(callback, message)
             return
 
-        loop.call_soon_threadsafe(self._safe_callback, callback, message)
+        self._call_soon_threadsafe(
+            loop,
+            self._safe_callback,
+            callback,
+            message,
+        )
 
-    @staticmethod
-    def _safe_callback(callback: Callable[..., None], *args: object) -> None:
+    def _call_soon_threadsafe(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        callback: Callable[..., None],
+        *args: object,
+    ) -> None:
+        try:
+            loop.call_soon_threadsafe(callback, *args)
+        except RuntimeError as exc:
+            self._log_warning(
+                "Dropping callback while event loop is closing: %s",
+                exc,
+            )
+
+    def _log_info(self, message: str, *args: object) -> None:
+        logger = self._logger
+        if logger is not None:
+            logger.info(message, *args)
+
+    def _log_warning(self, message: str, *args: object) -> None:
+        logger = self._logger
+        if logger is not None:
+            logger.warning(message, *args)
+
+    def _log_exception(self, message: str, exc: BaseException) -> None:
+        logger = self._logger
+        if logger is not None:
+            logger.error(message, exc_info=exc)
+
+    def _safe_callback(self, callback: Callable[..., None], *args: object) -> None:
         try:
             callback(*args)
-        except Exception:
+        except Exception as exc:
+            self._log_exception("Conversation callback failed", exc)
             return

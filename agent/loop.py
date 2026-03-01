@@ -27,9 +27,13 @@ class AgentLoop:
         self,
         inference: Any,
         prompt_builder: PromptBuilder = build_prompt,
+        tool_dispatcher: Any | None = None,
+        tool_schemas: list[dict[str, Any]] | None = None,
     ) -> None:
         self._inference = inference
         self._prompt_builder = prompt_builder
+        self._tool_dispatcher = tool_dispatcher
+        self._tool_schemas = list(tool_schemas or [])
 
     def step(
         self,
@@ -46,10 +50,11 @@ class AgentLoop:
             auxiliary_context,
             conversation_history=conversation_history,
         )
-        response = self._inference.generate(
+
+        response = self._run_inference(
             prompt,
-            on_stdout=on_model_stdout,
-            on_stderr=on_model_stderr,
+            on_model_stdout=on_model_stdout,
+            on_model_stderr=on_model_stderr,
         )
 
         return AgentTurn(
@@ -58,6 +63,81 @@ class AgentLoop:
             response=response,
             prompt=prompt,
         )
+
+    def _run_inference(
+        self,
+        prompt: PromptBundle,
+        *,
+        on_model_stdout: StreamChunkHandler | None,
+        on_model_stderr: StreamChunkHandler | None,
+    ) -> str:
+        if (
+            self._tool_dispatcher is None
+            or not self._tool_schemas
+            or not hasattr(self._inference, "generate_with_tools")
+        ):
+            return self._inference.generate(
+                prompt,
+                on_stdout=on_model_stdout,
+                on_stderr=on_model_stderr,
+            )
+
+        tool_result = self._inference.generate_with_tools(
+            prompt,
+            tools=self._tool_schemas,
+            on_stderr=on_model_stderr,
+        )
+
+        if not tool_result.tool_calls:
+            if isinstance(tool_result.content, str) and tool_result.content.strip():
+                return tool_result.content.strip()
+            return self._inference.generate(
+                prompt,
+                on_stdout=on_model_stdout,
+                on_stderr=on_model_stderr,
+            )
+
+        if not hasattr(self._inference, "complete"):
+            raise RuntimeError("Inference backend does not support tool completion")
+
+        tool_messages = list(prompt.messages)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": tool_result.content or "",
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    },
+                }
+                for call in tool_result.tool_calls
+            ],
+        }
+        tool_messages.append(assistant_message)
+
+        for tool_call in tool_result.tool_calls:
+            tool_output = self._tool_dispatcher.dispatch(
+                tool_call.name,
+                tool_call.arguments,
+            )
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.name,
+                    "content": tool_output,
+                }
+            )
+
+        response = self._inference.complete(
+            tool_messages,
+            on_stdout=on_model_stdout,
+            on_stderr=on_model_stderr,
+        )
+        return response
 
     def run(
         self,

@@ -74,14 +74,64 @@ class MemoryRetriever:
             "items": items,
         }
 
+    def lookup_entities(
+        self,
+        *,
+        current_visible_track_ids: set[int],
+        track_id: int | None = None,
+        class_name: str | None = None,
+        include_graph_context: bool = True,
+    ) -> dict[str, Any]:
+        normalized_class_name = class_name.strip().lower() if class_name else None
+        if track_id is None and not normalized_class_name:
+            raise ValueError("Provide track_id or class_name")
+
+        matches: list[SemanticIndexEntry] = []
+        for entry in self._semantic_index.entries_snapshot():
+            if track_id is not None and entry.track_id != track_id:
+                continue
+
+            if (
+                normalized_class_name is not None
+                and entry.object_type.strip().lower() != normalized_class_name
+            ):
+                continue
+
+            matches.append(entry)
+
+        sorted_matches = sorted(
+            matches,
+            key=lambda entry: (entry.indexed_world_version, entry.track_id),
+            reverse=True,
+        )
+
+        items = [
+            self._build_item(
+                entry=entry,
+                current_visible_track_ids=current_visible_track_ids,
+                similarity=None,
+                include_graph_context=include_graph_context,
+            )
+            for entry in sorted_matches
+        ]
+        return {
+            "count": len(items),
+            "items": items,
+        }
+
     def _build_item(
         self,
         *,
         entry: SemanticIndexEntry,
         current_visible_track_ids: set[int],
         similarity: float | None,
+        include_graph_context: bool = True,
     ) -> dict[str, Any]:
-        graph_snapshot = self._graph_history.latest_snapshot_for_track(entry.track_id)
+        graph_snapshot = (
+            self._graph_history.latest_snapshot_for_track(entry.track_id)
+            if include_graph_context
+            else None
+        )
 
         return {
             "track_id": entry.track_id,

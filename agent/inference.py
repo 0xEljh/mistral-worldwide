@@ -32,6 +32,20 @@ _QUANTIZATION_ALIASES = {
 StreamChunkHandler = Callable[[str], None]
 
 
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class ChatCompletionResult:
+    content: str | None
+    tool_calls: list[ToolCall]
+    finish_reason: str | None = None
+
+
 def _extract_assistant_response(raw_stdout: str, prompt_text: str) -> str:
     response_region = raw_stdout
 
@@ -432,6 +446,21 @@ class LlamaCppServerInference:
             on_stderr=on_stderr,
         )
 
+    def generate_with_tools(
+        self,
+        prompt: PromptBundle,
+        *,
+        tools: list[dict[str, Any]],
+        on_stderr: StreamChunkHandler | None = None,
+    ) -> ChatCompletionResult:
+        return self.complete_with_tools(
+            prompt.messages,
+            tools=tools,
+            max_tokens=self._config.max_tokens,
+            temperature=self._config.temperature,
+            on_stderr=on_stderr,
+        )
+
     def complete(
         self,
         messages: list[dict[str, Any]],
@@ -460,6 +489,39 @@ class LlamaCppServerInference:
             on_stdout=on_stdout,
             on_stderr=on_stderr,
         )
+
+    def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        on_stderr: StreamChunkHandler | None = None,
+    ) -> ChatCompletionResult:
+        if not tools:
+            raise ValueError("tools cannot be empty")
+
+        resolved_max_tokens = (
+            self._config.max_tokens if max_tokens is None else max_tokens
+        )
+        resolved_temperature = (
+            self._config.temperature if temperature is None else temperature
+        )
+
+        if resolved_max_tokens <= 0:
+            raise ValueError("max_tokens must be > 0")
+        if resolved_temperature < 0.0:
+            raise ValueError("temperature must be >= 0")
+
+        payload = self._request_chat_completion_payload(
+            messages=messages,
+            max_tokens=resolved_max_tokens,
+            temperature=resolved_temperature,
+            tools=tools,
+            on_stderr=on_stderr,
+        )
+        return self._parse_chat_completion_result(payload)
 
     def _request_chat_completion(
         self,
@@ -515,6 +577,148 @@ class LlamaCppServerInference:
             raise RuntimeError(
                 f"Failed to reach llama-server for chat completion at {self.base_url}."
             ) from exc
+
+    def _request_chat_completion_payload(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        tools: list[dict[str, Any]],
+        on_stderr: StreamChunkHandler | None,
+    ) -> dict[str, Any]:
+        self._ensure_running()
+
+        payload = {
+            "model": self.model_ref,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+            "tools": tools,
+        }
+        request = urllib.request.Request(
+            url=f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self._config.timeout_seconds,
+            ) as response:
+                raw_body = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace").strip()
+            if on_stderr is not None and error_body:
+                try:
+                    on_stderr(error_body)
+                except Exception:
+                    on_stderr = None
+            raise RuntimeError(
+                "llama-server chat completion request failed "
+                f"(status={exc.code}, model={self.model_ref}). "
+                f"body={error_body or '<empty>'}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            if on_stderr is not None:
+                try:
+                    on_stderr(str(exc))
+                except Exception:
+                    on_stderr = None
+            raise RuntimeError(
+                f"Failed to reach llama-server for chat completion at {self.base_url}."
+            ) from exc
+
+        try:
+            parsed_payload = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            body_tail = raw_body[-1000:] if len(raw_body) > 1000 else raw_body
+            raise RuntimeError(
+                "llama-server returned invalid JSON for chat completion. "
+                f"body={body_tail or '<empty>'}"
+            ) from exc
+
+        if not isinstance(parsed_payload, dict):
+            raise RuntimeError("llama-server chat completion payload is not an object")
+        return parsed_payload
+
+    @staticmethod
+    def _parse_chat_completion_result(payload: dict[str, Any]) -> ChatCompletionResult:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("llama-server chat completion payload has no choices")
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise RuntimeError("llama-server chat completion choice is not an object")
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError("llama-server chat completion choice has no message")
+
+        finish_reason = first_choice.get("finish_reason")
+        finish_reason_text = finish_reason if isinstance(finish_reason, str) else None
+
+        parsed_tool_calls: list[ToolCall] = []
+        raw_tool_calls = message.get("tool_calls")
+        if isinstance(raw_tool_calls, list):
+            for index, raw_tool_call in enumerate(raw_tool_calls):
+                if not isinstance(raw_tool_call, dict):
+                    continue
+
+                function = raw_tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+
+                name = function.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+
+                arguments = function.get("arguments")
+                if isinstance(arguments, dict):
+                    arguments_text = json.dumps(arguments, ensure_ascii=True)
+                elif isinstance(arguments, str):
+                    arguments_text = arguments
+                else:
+                    arguments_text = "{}"
+
+                call_id = raw_tool_call.get("id")
+                if isinstance(call_id, str) and call_id.strip():
+                    call_id_text = call_id.strip()
+                else:
+                    call_id_text = f"tool_call_{index}"
+
+                parsed_tool_calls.append(
+                    ToolCall(
+                        id=call_id_text,
+                        name=name.strip(),
+                        arguments=arguments_text,
+                    )
+                )
+
+        content = message.get("content")
+        content_text = (
+            content.strip() if isinstance(content, str) and content.strip() else None
+        )
+
+        if parsed_tool_calls:
+            return ChatCompletionResult(
+                content=content_text,
+                tool_calls=parsed_tool_calls,
+                finish_reason=finish_reason_text,
+            )
+
+        if content_text is None:
+            raise RuntimeError("llama-server chat completion returned empty content")
+
+        return ChatCompletionResult(
+            content=content_text,
+            tool_calls=[],
+            finish_reason=finish_reason_text,
+        )
 
     def __enter__(self) -> LlamaCppServerInference:
         self.start()

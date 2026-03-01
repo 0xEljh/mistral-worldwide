@@ -79,6 +79,8 @@ class WorldState:
         self.critical = False
         self.objects: dict[int, WorldObject] = {}
         self.crops = {}
+        self.frame_width = 0
+        self.frame_height = 0
         self.relations: dict[
             set, Relation
         ] = {}  # key: frozenset({id_a, id_b}), value: relation object
@@ -92,6 +94,9 @@ class WorldState:
         with self._lock:
             self.critical = False
             self.frame_index += 1
+            frame_height, frame_width = frame.shape[:2]
+            self.frame_width = int(frame_width)
+            self.frame_height = int(frame_height)
             if boxes.id is None:
                 return
 
@@ -249,6 +254,10 @@ class WorldState:
                 "critical": self.critical,
                 "world_version": self.version,
                 "timestamp": self.frame_index,
+                "frame_size": {
+                    "width": self.frame_width,
+                    "height": self.frame_height,
+                },
                 "objects": [
                     obj.to_dict() for obj in self.objects.values() if obj.visible
                 ],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import threading
 import time
@@ -11,6 +12,7 @@ from api.embedded_server import EmbeddedApiServer
 from agent.crop_describer import CropDescriptionStore, run_crop_description_loop
 from agent.inference import LlamaCppServerConfig, LlamaCppServerInference
 from agent.loop import AgentLoop, AgentTurn
+from agent.tools import TOOL_SCHEMAS, ToolDispatcher
 from memory import EmbeddingModel, GraphHistoryStore, MemoryRetriever, SemanticIndex
 from observability.vizgraph import GraphSnapshotRecorder
 from perception.frame_provider import FrameSourceMode
@@ -66,6 +68,38 @@ def _is_indexable_description(text: str) -> bool:
     return not any(marker in normalized for marker in unavailable_markers)
 
 
+def _resolve_interactive_log_path(log_file: str | None) -> Path:
+    if log_file is not None and log_file.strip():
+        return Path(log_file).expanduser().resolve()
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    return (
+        Path(__file__).resolve().parents[1]
+        / "artifacts"
+        / "logs"
+        / f"interactive-{timestamp}.log"
+    )
+
+
+def _build_interactive_logger(log_path: Path) -> logging.Logger:
+    logger = logging.getLogger(f"pipeline.interactive.{log_path.stem}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if logger.handlers:
+        return logger
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    logger.addHandler(file_handler)
+
+    return logger
+
+
 def run_pipeline(
     user_prompt: str = "",
     quantization: str = "Q4_K_M",
@@ -93,6 +127,8 @@ def run_pipeline(
     interactive_user_input: bool = False,
     interactive_history_window_turns: int = 6,
     interactive_status_refresh_interval_seconds: float = 1.0,
+    interactive_transcript_max_lines: int = 2000,
+    interactive_log_file: str | None = None,
     graph_history_interval_world_versions: int = 200,
     graph_history_max_snapshots: int = 50,
     graph_snapshot_interval: int = 1000,
@@ -105,6 +141,8 @@ def run_pipeline(
         raise ValueError("interactive_history_window_turns must be > 0")
     if interactive_status_refresh_interval_seconds <= 0.0:
         raise ValueError("interactive_status_refresh_interval_seconds must be > 0")
+    if interactive_transcript_max_lines <= 0:
+        raise ValueError("interactive_transcript_max_lines must be > 0")
     if graph_history_interval_world_versions <= 0:
         raise ValueError("graph_history_interval_world_versions must be > 0")
     if graph_history_max_snapshots <= 0:
@@ -366,7 +404,16 @@ def run_pipeline(
         )
         crop_description_thread.start()
 
-        agent_loop = AgentLoop(inference=inference)
+        tool_dispatcher = ToolDispatcher(
+            retriever=memory_retriever,
+            scene_state_provider=shared_state.snapshot,
+            text_by_track_id_provider=crop_description_store.text_by_track_id,
+        )
+        agent_loop = AgentLoop(
+            inference=inference,
+            tool_dispatcher=tool_dispatcher,
+            tool_schemas=TOOL_SCHEMAS,
+        )
         latest_scene_state: dict[str, Any] | None = None
 
         def _ensure_background_health() -> None:
@@ -488,9 +535,14 @@ def run_pipeline(
                     "Run 'uv sync' and retry."
                 ) from exc
 
+            interactive_log_path = _resolve_interactive_log_path(interactive_log_file)
+            interactive_logger = _build_interactive_logger(interactive_log_path)
+
             print(
                 "[pipeline] Interactive conversation UI enabled. Press Ctrl+C to quit."
             )
+            print(f"[pipeline] Interactive logs: {interactive_log_path}")
+            interactive_logger.info("Interactive mode started")
 
             conversation_manager = ConversationManager(
                 agent_loop=agent_loop,
@@ -504,6 +556,7 @@ def run_pipeline(
                 history_window_turns=interactive_history_window_turns,
                 max_steps=max_steps,
                 stream_llm_output=stream_llm_output,
+                logger=interactive_logger,
             )
 
             app = InteractiveConversationApp(
@@ -513,8 +566,23 @@ def run_pipeline(
                 status_refresh_interval_seconds=(
                     interactive_status_refresh_interval_seconds
                 ),
+                transcript_max_lines=interactive_transcript_max_lines,
+                logger=interactive_logger,
             )
-            app.run()
+            try:
+                app.run()
+            except KeyboardInterrupt:
+                interactive_logger.info("KeyboardInterrupt received; closing app")
+                print("\n[pipeline] Interrupted. Closing interactive mode.")
+            except Exception as exc:
+                interactive_logger.exception(
+                    "Interactive UI crashed",
+                    exc_info=exc,
+                )
+                raise
+            finally:
+                conversation_manager.request_stop()
+                interactive_logger.info("Interactive mode stopped")
         else:
             agent_loop.run(
                 state_provider=_state_provider,
@@ -614,6 +682,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="How often the interactive status bar refreshes scene counters.",
     )
     parser.add_argument(
+        "--interactive-transcript-max-lines",
+        type=int,
+        default=2000,
+        help="Maximum transcript lines retained in the TUI before trimming.",
+    )
+    parser.add_argument(
+        "--interactive-log-file",
+        default="",
+        help=(
+            "Optional file path for interactive-mode logs. "
+            "Defaults to artifacts/logs/interactive-<timestamp>.log"
+        ),
+    )
+    parser.add_argument(
         "--semantic-search-top-k",
         type=int,
         default=5,
@@ -711,43 +793,50 @@ def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    run_pipeline(
-        user_prompt=args.user_prompt,
-        quantization=args.quantization,
-        poll_interval_seconds=args.poll_interval_seconds,
-        crop_description_poll_interval_seconds=(
-            args.crop_description_poll_interval_seconds
-        ),
-        max_steps=args.max_steps,
-        interactive_user_input=args.interactive_user_input,
-        interactive_history_window_turns=args.interactive_history_window_turns,
-        interactive_status_refresh_interval_seconds=(
-            args.interactive_status_refresh_interval_seconds
-        ),
-        semantic_search_top_k=args.semantic_search_top_k,
-        stream_llm_output=not args.no_stream_llm_output,
-        perception_startup_timeout_seconds=args.perception_startup_timeout_seconds,
-        camera_index=args.camera_index,
-        display_perception=not args.no_display_perception,
-        model_path=args.model_path,
-        tracker_path=args.tracker_path,
-        frame_source_mode=cast(FrameSourceMode, args.frame_source_mode),
-        api_stale_after_seconds=args.api_stale_after_seconds,
-        switch_to_api_after_consecutive=args.switch_to_api_after_consecutive,
-        switch_cooldown_seconds=args.switch_cooldown_seconds,
-        api_ingest_host=args.api_ingest_host,
-        api_ingest_port=args.api_ingest_port,
-        api_ingest_startup_timeout_seconds=args.api_ingest_startup_timeout_seconds,
-        llm_server_port=args.llm_server_port,
-        llm_gpu_layers=args.llm_gpu_layers,
-        llm_cpu_only=args.llm_cpu_only,
-        llm_cpu_fallback=not args.no_llm_cpu_fallback,
-        graph_history_interval_world_versions=(
-            args.graph_history_interval_world_versions
-        ),
-        graph_history_max_snapshots=args.graph_history_max_snapshots,
-        graph_snapshot_interval=args.graph_snapshot_interval,
-    )
+    try:
+        run_pipeline(
+            user_prompt=args.user_prompt,
+            quantization=args.quantization,
+            poll_interval_seconds=args.poll_interval_seconds,
+            crop_description_poll_interval_seconds=(
+                args.crop_description_poll_interval_seconds
+            ),
+            max_steps=args.max_steps,
+            interactive_user_input=args.interactive_user_input,
+            interactive_history_window_turns=args.interactive_history_window_turns,
+            interactive_status_refresh_interval_seconds=(
+                args.interactive_status_refresh_interval_seconds
+            ),
+            interactive_transcript_max_lines=args.interactive_transcript_max_lines,
+            interactive_log_file=args.interactive_log_file,
+            semantic_search_top_k=args.semantic_search_top_k,
+            stream_llm_output=not args.no_stream_llm_output,
+            perception_startup_timeout_seconds=args.perception_startup_timeout_seconds,
+            camera_index=args.camera_index,
+            display_perception=not args.no_display_perception,
+            model_path=args.model_path,
+            tracker_path=args.tracker_path,
+            frame_source_mode=cast(FrameSourceMode, args.frame_source_mode),
+            api_stale_after_seconds=args.api_stale_after_seconds,
+            switch_to_api_after_consecutive=args.switch_to_api_after_consecutive,
+            switch_cooldown_seconds=args.switch_cooldown_seconds,
+            api_ingest_host=args.api_ingest_host,
+            api_ingest_port=args.api_ingest_port,
+            api_ingest_startup_timeout_seconds=(
+                args.api_ingest_startup_timeout_seconds
+            ),
+            llm_server_port=args.llm_server_port,
+            llm_gpu_layers=args.llm_gpu_layers,
+            llm_cpu_only=args.llm_cpu_only,
+            llm_cpu_fallback=not args.no_llm_cpu_fallback,
+            graph_history_interval_world_versions=(
+                args.graph_history_interval_world_versions
+            ),
+            graph_history_max_snapshots=args.graph_history_max_snapshots,
+            graph_snapshot_interval=args.graph_snapshot_interval,
+        )
+    except KeyboardInterrupt:
+        print("\n[pipeline] Interrupted.")
 
 
 if __name__ == "__main__":
