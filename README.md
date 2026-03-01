@@ -59,6 +59,9 @@ flowchart LR
 - **Voice I/O** — ElevenLabs STT and TTS for spoken conversation with the agent.
 - **WebSocket frame ingest** — Stream video frames from remote cameras or browsers via a FastAPI websocket endpoint, with automatic local/API source switching.
 - **Graph visualization** — Periodic PNG snapshots of the world graph rendered via NetworkX and Matplotlib.
+
+![World Graph — entity relation graph showing detected objects and their spatial relations](docs/world_graph_example.png)
+
 - **Multimodal crop description** — Background thread describes detected object crops via multimodal LLM inference and indexes the descriptions for semantic search.
 
 ## How It Works
@@ -161,7 +164,7 @@ Key design decisions:
 
 #### Graph History Store (`memory/graph_history.py`)
 
-The graph history store saves periodic snapshots of the world graph (every N world versions, default 200) in a bounded buffer (default 50 snapshots). When the buffer is full, a **score-based stochastic eviction policy** removes low-value snapshots while preserving temporal diversity.
+The graph history store saves periodic snapshots of the world graph (every N world versions, default 50) in a bounded buffer (default 100 snapshots). When the buffer is full, a **score-based stochastic eviction policy** removes low-value snapshots while preserving temporal diversity.
 
 **Snapshot scoring** combines four weighted components:
 
@@ -369,7 +372,9 @@ In `auto` mode (default), the pipeline prefers API frames when available and fal
 | `--llm-gpu-layers`                              | `auto`                                | llama.cpp GPU layer offload count                    |
 | `--llm-cpu-only`                                | off                                   | Force CPU inference                                  |
 | `--no-llm-cpu-fallback`                         | off                                   | Fail fast if GPU startup fails                       |
-| `--graph-snapshot-interval`                     | `1000`                                | Save world-graph PNG every N versions (`0` disables) |
+| `--graph-history-interval-world-versions`       | `50`                                  | Persist world graph history every N world versions   |
+| `--graph-history-max-snapshots`                 | `100`                                 | Max world graph history snapshots to retain          |
+| `--graph-snapshot-interval`                     | `100`                                 | Save world-graph PNG every N versions (`0` disables) |
 
 ## Project Structure
 

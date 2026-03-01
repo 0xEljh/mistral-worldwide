@@ -28,8 +28,8 @@ class GraphHistoryStore:
     def __init__(
         self,
         *,
-        save_interval_world_versions: int = 200,
-        max_snapshots: int = 50,
+        save_interval_world_versions: int = 50,
+        max_snapshots: int = 100,
         protected_recent_snapshots: int | None = None,
         age_decay_frames: float = 5000.0,
         reference_visible_entity_count: float = 10.0,

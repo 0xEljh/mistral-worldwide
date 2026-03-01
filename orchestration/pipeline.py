@@ -108,9 +108,9 @@ def run_pipeline(
     interactive_status_refresh_interval_seconds: float = 1.0,
     interactive_transcript_max_lines: int = 2000,
     interactive_log_file: str | None = None,
-    graph_history_interval_world_versions: int = 200,
-    graph_history_max_snapshots: int = 50,
-    graph_snapshot_interval: int = 1000,
+    graph_history_interval_world_versions: int = 50,
+    graph_history_max_snapshots: int = 100,
+    graph_snapshot_interval: int = 100,
     offline: bool = False,
 ) -> None:
     if graph_snapshot_interval < 0:
@@ -691,13 +691,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--graph-history-interval-world-versions",
         type=int,
-        default=200,
+        default=50,
         help="Persist world graph history every N world versions.",
     )
     parser.add_argument(
         "--graph-history-max-snapshots",
         type=int,
-        default=50,
+        default=100,
         help="Maximum number of world graph history snapshots to retain.",
     )
     parser.add_argument(
