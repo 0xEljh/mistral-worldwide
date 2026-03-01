@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn",
     "websockets",
     "pydantic",
+    "matplotlib",
     "networkx",
     "numpy",
     "opencv-python",
