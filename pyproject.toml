@@ -20,6 +20,7 @@ dependencies = [
     "torch>=2.4",
     "transformers>=4.40",
     "vllm>=0.16.0",
+    "textual>=0.75.0",
 ]
 
 [build-system]

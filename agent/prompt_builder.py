@@ -20,6 +20,38 @@ class PromptBundle:
     messages: list[dict[str, str]]
 
 
+def _normalize_conversation_history(
+    conversation_history: list[Mapping[str, Any]] | None,
+) -> list[dict[str, str]]:
+    if not conversation_history:
+        return []
+
+    normalized_messages: list[dict[str, str]] = []
+    for message in conversation_history:
+        if not isinstance(message, Mapping):
+            continue
+
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"}:
+            continue
+        if not isinstance(content, str):
+            continue
+
+        normalized_content = content.strip()
+        if not normalized_content:
+            continue
+
+        normalized_messages.append(
+            {
+                "role": role,
+                "content": normalized_content,
+            }
+        )
+
+    return normalized_messages
+
+
 def _format_object_descriptions_context(context: Any) -> str:
     if not isinstance(context, Mapping):
         return _safe_json_dump(context)
@@ -233,6 +265,7 @@ def build_prompt(
     user_prompt: str = "",
     auxiliary_context: Mapping[str, Any] | None = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    conversation_history: list[Mapping[str, Any]] | None = None,
 ) -> PromptBundle:
     normalized_user_prompt = user_prompt.strip()
     scene_memory_json = _safe_json_dump(scene_state)
@@ -253,10 +286,9 @@ def build_prompt(
 
     composed_user_prompt = "\n\n".join(prompt_sections)
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": composed_user_prompt},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(_normalize_conversation_history(conversation_history))
+    messages.append({"role": "user", "content": composed_user_prompt})
 
     return PromptBundle(
         system_prompt=system_prompt,

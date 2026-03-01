@@ -127,9 +127,15 @@ class WorldState:
                             )
                         ]
                         self.critical = True
-                        self.events.append(f"{obj.type}_{track_id} moved {direction}" + f" at frame {self.frame_index}")
+                        self.events.append(
+                            f"{obj.type}_{track_id} moved {direction}"
+                            + f" at frame {self.frame_index}"
+                        )
                     elif prev_moving_state and not obj.moving:
-                        self.events.append(f"{obj.type}_{track_id} stopped" + f" at frame {self.frame_index}")
+                        self.events.append(
+                            f"{obj.type}_{track_id} stopped"
+                            + f" at frame {self.frame_index}"
+                        )
                 else:
                     self.objects[track_id] = WorldObject(
                         track_id,
@@ -140,7 +146,10 @@ class WorldState:
                         xyxy,
                     )
                     self.critical = True
-                    self.events.append(f"{class_name}_{track_id} appeared" + f" at frame {self.frame_index}")
+                    self.events.append(
+                        f"{class_name}_{track_id} appeared"
+                        + f" at frame {self.frame_index}"
+                    )
 
             for track_id, obj in self.objects.items():
                 is_missing = track_id not in seen_ids
@@ -153,7 +162,10 @@ class WorldState:
                 ):
                     obj.mark_missing()
                     self.critical = True
-                    self.events.append(f"{obj.type}_{track_id} disappeared" + f" at frame {self.frame_index}")
+                    self.events.append(
+                        f"{obj.type}_{track_id} disappeared"
+                        + f" at frame {self.frame_index}"
+                    )
 
             self._update_relations_delta(seen_ids)
 
@@ -234,6 +246,7 @@ class WorldState:
     def snapshot(self) -> dict:
         with self._lock:
             return {
+                "critical": self.critical,
                 "world_version": self.version,
                 "timestamp": self.frame_index,
                 "objects": [

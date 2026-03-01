@@ -10,7 +10,7 @@ SceneState = Mapping[str, Any]
 SceneStateProvider = Callable[[], SceneState]
 AuxiliaryContext = Mapping[str, Any]
 AuxiliaryContextProvider = Callable[[], AuxiliaryContext]
-PromptBuilder = Callable[[SceneState, str, AuxiliaryContext | None], PromptBundle]
+PromptBuilder = Callable[..., PromptBundle]
 StreamChunkHandler = Callable[[str], None]
 
 
@@ -36,10 +36,16 @@ class AgentLoop:
         scene_state: SceneState,
         user_prompt: str = "",
         auxiliary_context: AuxiliaryContext | None = None,
+        conversation_history: list[Mapping[str, Any]] | None = None,
         on_model_stdout: StreamChunkHandler | None = None,
         on_model_stderr: StreamChunkHandler | None = None,
     ) -> AgentTurn:
-        prompt = self._prompt_builder(scene_state, user_prompt, auxiliary_context)
+        prompt = self._prompt_builder(
+            scene_state,
+            user_prompt,
+            auxiliary_context,
+            conversation_history=conversation_history,
+        )
         response = self._inference.generate(
             prompt,
             on_stdout=on_model_stdout,

@@ -1,0 +1,21 @@
+Screen {
+    layout: vertical;
+}
+
+#status {
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+#transcript {
+    height: 1fr;
+    margin: 0 1;
+    border: round $accent;
+}
+
+#prompt-input {
+    height: 3;
+    margin: 0 1 1 1;
+}

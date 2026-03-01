@@ -91,6 +91,8 @@ def run_pipeline(
     llm_cpu_fallback: bool = True,
     semantic_search_top_k: int = 5,
     interactive_user_input: bool = False,
+    interactive_history_window_turns: int = 6,
+    interactive_status_refresh_interval_seconds: float = 1.0,
     graph_history_interval_world_versions: int = 200,
     graph_history_max_snapshots: int = 50,
     graph_snapshot_interval: int = 1000,
@@ -99,6 +101,10 @@ def run_pipeline(
         raise ValueError("graph_snapshot_interval must be >= 0")
     if semantic_search_top_k <= 0:
         raise ValueError("semantic_search_top_k must be > 0")
+    if interactive_history_window_turns <= 0:
+        raise ValueError("interactive_history_window_turns must be > 0")
+    if interactive_status_refresh_interval_seconds <= 0.0:
+        raise ValueError("interactive_status_refresh_interval_seconds must be > 0")
     if graph_history_interval_world_versions <= 0:
         raise ValueError("graph_history_interval_world_versions must be > 0")
     if graph_history_max_snapshots <= 0:
@@ -123,6 +129,7 @@ def run_pipeline(
     crop_description_thread: threading.Thread | None = None
     inference: LlamaCppServerInference | None = None
     graph_recorder: GraphSnapshotRecorder | None = None
+    conversation_manager: Any | None = None
 
     if graph_snapshot_interval > 0:
         graph_run_id = time.strftime("%Y%m%d-%H%M%S")
@@ -147,6 +154,20 @@ def run_pipeline(
 
     try:
         graph_snapshot_error_reported = False
+
+        def _critical_event_description(snapshot: Mapping[str, Any]) -> str:
+            recent_events = snapshot.get("recent_events")
+            if isinstance(recent_events, list):
+                for raw_event in reversed(recent_events):
+                    if isinstance(raw_event, str) and raw_event.strip():
+                        return raw_event.strip()
+
+            world_version = int(snapshot.get("world_version", -1))
+            frame_index = int(snapshot.get("timestamp", -1))
+            return (
+                "Critical world-state change detected "
+                f"(world_version={world_version}, frame={frame_index})."
+            )
 
         def _on_world_snapshot(snapshot: dict) -> None:
             nonlocal graph_snapshot_error_reported
@@ -174,6 +195,17 @@ def run_pipeline(
                 print(f"[memory] Failed to save graph history snapshot: {exc}")
                 return
 
+            if conversation_manager is not None and bool(
+                snapshot.get("critical", False)
+            ):
+                world_version = int(snapshot.get("world_version", -1))
+                frame_index = int(snapshot.get("timestamp", -1))
+                conversation_manager.notify_critical_vision_event(
+                    description=_critical_event_description(snapshot),
+                    world_version=world_version,
+                    frame_index=frame_index,
+                )
+
             if graph_recorder is None:
                 return
 
@@ -188,7 +220,7 @@ def run_pipeline(
                     graph_snapshot_error_reported = True
                 return
 
-            if saved_path is not None:
+            if saved_path is not None and not interactive_user_input:
                 print(f"[observability] Saved graph snapshot: {saved_path}")
 
         if frame_source_mode in {"auto", "api"}:
@@ -319,7 +351,11 @@ def run_pipeline(
                     store=crop_description_store,
                     stop_event=stop_event,
                     poll_interval_seconds=crop_description_poll_interval_seconds,
-                    on_error=_on_model_stderr if stream_llm_output else None,
+                    on_error=(
+                        _on_model_stderr
+                        if stream_llm_output and not interactive_user_input
+                        else None
+                    ),
                 )
             except Exception as exc:  # pragma: no cover - best effort crash forwarding
                 failure_box["error"] = exc
@@ -443,63 +479,42 @@ def run_pipeline(
             )
 
         if interactive_user_input:
+            try:
+                from conversation.manager import ConversationManager
+                from ui.app import InteractiveConversationApp
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "Interactive mode now requires the Textual UI dependency. "
+                    "Run 'uv sync' and retry."
+                ) from exc
+
             print(
-                "[pipeline] Interactive query mode enabled. "
-                "Type a query and press Enter. Type 'exit' to quit."
+                "[pipeline] Interactive conversation UI enabled. Press Ctrl+C to quit."
             )
 
-            turns_completed = 0
-            pending_query = user_prompt.strip()
-
-            while max_steps is None or turns_completed < max_steps:
-                if pending_query:
-                    query_text = pending_query
-                    pending_query = ""
-                    print(f"[user] {query_text}")
-                else:
-                    try:
-                        query_text = input("\n[user] > ").strip()
-                    except EOFError:
-                        print(
-                            "\n[pipeline] Input stream closed. Exiting interactive mode."
-                        )
-                        break
-                    except KeyboardInterrupt:
-                        print("\n[pipeline] Interrupted. Exiting interactive mode.")
-                        break
-
-                if not query_text:
-                    continue
-
-                if query_text.lower() in {"exit", "quit", "q"}:
-                    print("[pipeline] Exiting interactive mode.")
-                    break
-
-                scene_state = _state_provider()
-
-                if stream_llm_output:
-                    print(
-                        f"\n[agent] world_version={int(scene_state.get('world_version', -1))} "
-                        f"frame={int(scene_state.get('timestamp', -1))}",
-                        flush=True,
-                    )
-
-                turn = agent_loop.step(
-                    scene_state,
-                    user_prompt=query_text,
-                    auxiliary_context=_build_auxiliary_context(
+            conversation_manager = ConversationManager(
+                agent_loop=agent_loop,
+                state_provider=_state_provider,
+                auxiliary_context_builder=(
+                    lambda scene_state, query_text: _build_auxiliary_context(
                         scene_state=scene_state,
                         query_text=query_text,
-                    ),
-                    on_model_stdout=_on_model_stdout if stream_llm_output else None,
-                    on_model_stderr=_on_model_stderr if stream_llm_output else None,
-                )
-                turns_completed += 1
+                    )
+                ),
+                history_window_turns=interactive_history_window_turns,
+                max_steps=max_steps,
+                stream_llm_output=stream_llm_output,
+            )
 
-                if stream_llm_output:
-                    print("", flush=True)
-                else:
-                    _default_turn_handler(turn)
+            app = InteractiveConversationApp(
+                conversation_manager=conversation_manager,
+                state_provider=_state_provider,
+                initial_user_prompt=user_prompt,
+                status_refresh_interval_seconds=(
+                    interactive_status_refresh_interval_seconds
+                ),
+            )
+            app.run()
         else:
             agent_loop.run(
                 state_provider=_state_provider,
@@ -584,7 +599,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--interactive-user-input",
         action="store_true",
-        help="Run an interactive REPL and wait for user queries on stdin.",
+        help="Run the interactive Textual conversation UI.",
+    )
+    parser.add_argument(
+        "--interactive-history-window-turns",
+        type=int,
+        default=6,
+        help="Number of prior user/assistant turns to include in interactive mode.",
+    )
+    parser.add_argument(
+        "--interactive-status-refresh-interval-seconds",
+        type=float,
+        default=1.0,
+        help="How often the interactive status bar refreshes scene counters.",
     )
     parser.add_argument(
         "--semantic-search-top-k",
@@ -674,7 +701,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--graph-snapshot-interval",
         type=int,
-        default=1000,
+        default=100,
         help="Save world graph PNG snapshots every N world versions (0 disables).",
     )
     return parser
@@ -693,6 +720,10 @@ def main() -> None:
         ),
         max_steps=args.max_steps,
         interactive_user_input=args.interactive_user_input,
+        interactive_history_window_turns=args.interactive_history_window_turns,
+        interactive_status_refresh_interval_seconds=(
+            args.interactive_status_refresh_interval_seconds
+        ),
         semantic_search_top_k=args.semantic_search_top_k,
         stream_llm_output=not args.no_stream_llm_output,
         perception_startup_timeout_seconds=args.perception_startup_timeout_seconds,
