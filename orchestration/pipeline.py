@@ -4,12 +4,15 @@ import argparse
 import sys
 import threading
 import time
-from typing import Any, cast
+from pathlib import Path
+from typing import Any, Mapping, cast
 
 from api.embedded_server import EmbeddedApiServer
 from agent.crop_describer import CropDescriptionStore, run_crop_description_loop
 from agent.inference import LlamaCppServerConfig, LlamaCppServerInference
 from agent.loop import AgentLoop, AgentTurn
+from memory import EmbeddingModel, GraphHistoryStore, MemoryRetriever, SemanticIndex
+from observability.vizgraph import GraphSnapshotRecorder
 from perception.frame_provider import FrameSourceMode
 from perception.yoloworldstate import WorldState, run_world_state_tracking_loop
 
@@ -26,6 +29,41 @@ def _streaming_turn_handler(turn: AgentTurn) -> None:
         f"\n[agent] world_version={turn.world_version} frame={turn.scene_timestamp}",
         flush=True,
     )
+
+
+def _extract_visible_track_ids(scene_state: Mapping[str, Any]) -> set[int]:
+    objects = scene_state.get("objects")
+    if not isinstance(objects, list):
+        return set()
+
+    visible_track_ids: set[int] = set()
+    for object_entry in objects:
+        if not isinstance(object_entry, Mapping):
+            continue
+
+        raw_track_id = object_entry.get("id")
+        if raw_track_id is None:
+            continue
+
+        try:
+            visible_track_ids.add(int(raw_track_id))
+        except (TypeError, ValueError):
+            continue
+
+    return visible_track_ids
+
+
+def _is_indexable_description(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+
+    unavailable_markers = (
+        "description unavailable",
+        "invalid crop data",
+        "inference error",
+    )
+    return not any(marker in normalized for marker in unavailable_markers)
 
 
 def run_pipeline(
@@ -51,17 +89,108 @@ def run_pipeline(
     llm_gpu_layers: str = "auto",
     llm_cpu_only: bool = False,
     llm_cpu_fallback: bool = True,
+    semantic_search_top_k: int = 5,
+    interactive_user_input: bool = False,
+    graph_history_interval_world_versions: int = 200,
+    graph_history_max_snapshots: int = 50,
+    graph_snapshot_interval: int = 1000,
 ) -> None:
+    if graph_snapshot_interval < 0:
+        raise ValueError("graph_snapshot_interval must be >= 0")
+    if semantic_search_top_k <= 0:
+        raise ValueError("semantic_search_top_k must be > 0")
+    if graph_history_interval_world_versions <= 0:
+        raise ValueError("graph_history_interval_world_versions must be > 0")
+    if graph_history_max_snapshots <= 0:
+        raise ValueError("graph_history_max_snapshots must be > 0")
+
     shared_state = WorldState()
     crop_description_store = CropDescriptionStore()
+    embedding_model = EmbeddingModel()
+    semantic_index = SemanticIndex(embedding_model)
+    graph_history_store = GraphHistoryStore(
+        save_interval_world_versions=graph_history_interval_world_versions,
+        max_snapshots=graph_history_max_snapshots,
+    )
+    memory_retriever = MemoryRetriever(
+        semantic_index=semantic_index,
+        graph_history=graph_history_store,
+    )
     stop_event = threading.Event()
     failure_box: dict[str, Exception | None] = {"error": None}
     embedded_api_server: EmbeddedApiServer | None = None
     perception_thread: threading.Thread | None = None
     crop_description_thread: threading.Thread | None = None
     inference: LlamaCppServerInference | None = None
+    graph_recorder: GraphSnapshotRecorder | None = None
+
+    if graph_snapshot_interval > 0:
+        graph_run_id = time.strftime("%Y%m%d-%H%M%S")
+        graph_output_dir = (
+            Path(__file__).resolve().parents[1] / "artifacts" / "graphs" / graph_run_id
+        )
+        graph_recorder = GraphSnapshotRecorder(
+            output_dir=graph_output_dir,
+            interval=graph_snapshot_interval,
+        )
+        print(
+            "[observability] Graph snapshots enabled "
+            f"every {graph_snapshot_interval} world versions at {graph_output_dir}"
+        )
+
+    print(
+        "[memory] Semantic memory enabled "
+        f"(faiss, model={embedding_model.model_name}, "
+        f"graph_history every {graph_history_interval_world_versions} versions, "
+        f"max {graph_history_max_snapshots} snapshots)"
+    )
 
     try:
+        graph_snapshot_error_reported = False
+
+        def _on_world_snapshot(snapshot: dict) -> None:
+            nonlocal graph_snapshot_error_reported
+
+            try:
+                text_by_track_id: Mapping[int, str] | None = None
+                try:
+                    world_version = int(snapshot.get("world_version", 0))
+                except (TypeError, ValueError):
+                    world_version = 0
+
+                if (
+                    world_version > 0
+                    and world_version % graph_history_store.save_interval_world_versions
+                    == 0
+                ):
+                    text_by_track_id = crop_description_store.text_by_track_id()
+
+                graph_history_store.maybe_save(
+                    snapshot,
+                    text_by_track_id=text_by_track_id,
+                )
+            except Exception as exc:
+                failure_box["error"] = exc
+                print(f"[memory] Failed to save graph history snapshot: {exc}")
+                return
+
+            if graph_recorder is None:
+                return
+
+            try:
+                saved_path = graph_recorder.maybe_record(snapshot)
+            except Exception as exc:  # pragma: no cover - best effort observability
+                if not graph_snapshot_error_reported:
+                    print(
+                        "[observability] Failed to write graph snapshot; "
+                        f"continuing without graph exports. Reason: {exc}"
+                    )
+                    graph_snapshot_error_reported = True
+                return
+
+            if saved_path is not None:
+                print(f"[observability] Saved graph snapshot: {saved_path}")
+
         if frame_source_mode in {"auto", "api"}:
             candidate_api_server = EmbeddedApiServer(
                 host=api_ingest_host,
@@ -96,6 +225,7 @@ def run_pipeline(
                     model_path=model_path,
                     tracker_path=tracker_path,
                     display=display_perception,
+                    on_snapshot=_on_world_snapshot,
                     stop_event=stop_event,
                     frame_source_mode=frame_source_mode,
                     api_stale_after_seconds=api_stale_after_seconds,
@@ -201,8 +331,9 @@ def run_pipeline(
         crop_description_thread.start()
 
         agent_loop = AgentLoop(inference=inference)
+        latest_scene_state: dict[str, Any] | None = None
 
-        def _state_provider() -> dict[str, Any]:
+        def _ensure_background_health() -> None:
             if failure_box["error"] is not None:
                 raise RuntimeError("Pipeline background loop failed") from failure_box[
                     "error"
@@ -211,14 +342,6 @@ def run_pipeline(
             if not perception_thread.is_alive() and not stop_event.is_set():
                 raise RuntimeError("Perception loop exited unexpectedly")
 
-            return shared_state.snapshot()
-
-        def _auxiliary_context_provider() -> dict[str, Any]:
-            if failure_box["error"] is not None:
-                raise RuntimeError("Pipeline background loop failed") from failure_box[
-                    "error"
-                ]
-
             if (
                 crop_description_thread is not None
                 and not crop_description_thread.is_alive()
@@ -226,23 +349,173 @@ def run_pipeline(
             ):
                 raise RuntimeError("Crop description loop exited unexpectedly")
 
-            return {
-                "object_descriptions": crop_description_store.snapshot(),
+        def _index_new_descriptions(
+            descriptions_snapshot: Mapping[str, Any],
+            *,
+            world_version: int,
+        ) -> None:
+            raw_items = descriptions_snapshot.get("items")
+            if not isinstance(raw_items, list):
+                return
+
+            for raw_item in raw_items:
+                if not isinstance(raw_item, Mapping):
+                    continue
+
+                raw_track_id = raw_item.get("id")
+                raw_description = raw_item.get("description")
+                if raw_track_id is None or not isinstance(raw_description, str):
+                    continue
+
+                if not _is_indexable_description(raw_description):
+                    continue
+
+                try:
+                    track_id = int(raw_track_id)
+                except (TypeError, ValueError):
+                    continue
+
+                object_type = raw_item.get("type")
+                object_type_text = (
+                    object_type.strip()
+                    if isinstance(object_type, str) and object_type.strip()
+                    else "object"
+                )
+
+                raw_described_at = raw_item.get("described_at")
+                described_at = (
+                    float(raw_described_at)
+                    if isinstance(raw_described_at, (int, float))
+                    else None
+                )
+
+                semantic_index.add(
+                    track_id=track_id,
+                    object_type=object_type_text,
+                    description=raw_description,
+                    indexed_world_version=world_version,
+                    described_at=described_at,
+                )
+
+        def _build_auxiliary_context(
+            *,
+            scene_state: Mapping[str, Any],
+            query_text: str,
+        ) -> dict[str, Any]:
+            descriptions_snapshot = crop_description_store.snapshot()
+            world_version = int(scene_state.get("world_version", 0))
+            _index_new_descriptions(
+                descriptions_snapshot,
+                world_version=world_version,
+            )
+
+            visible_track_ids = _extract_visible_track_ids(scene_state)
+            entity_memory_context = memory_retriever.all_entity_memory_context(
+                current_visible_track_ids=visible_track_ids,
+            )
+
+            context: dict[str, Any] = {
+                "object_descriptions": descriptions_snapshot,
+                "entity_memory": entity_memory_context,
             }
 
-        agent_loop.run(
-            state_provider=_state_provider,
-            user_prompt=user_prompt,
-            poll_interval_seconds=poll_interval_seconds,
-            require_initialized_state=False,
-            max_steps=max_steps,
-            auxiliary_context_provider=_auxiliary_context_provider,
-            on_turn=(
-                _streaming_turn_handler if stream_llm_output else _default_turn_handler
-            ),
-            on_model_stdout=_on_model_stdout if stream_llm_output else None,
-            on_model_stderr=_on_model_stderr if stream_llm_output else None,
-        )
+            if query_text.strip():
+                context["semantic_entity_matches"] = memory_retriever.query_context(
+                    query_text,
+                    top_k=semantic_search_top_k,
+                    current_visible_track_ids=visible_track_ids,
+                )
+
+            return context
+
+        def _state_provider() -> dict[str, Any]:
+            nonlocal latest_scene_state
+            _ensure_background_health()
+            latest_scene_state = shared_state.snapshot()
+            return latest_scene_state
+
+        def _auxiliary_context_provider() -> dict[str, Any]:
+            _ensure_background_health()
+            scene_state = latest_scene_state or shared_state.snapshot()
+            return _build_auxiliary_context(
+                scene_state=scene_state,
+                query_text=user_prompt,
+            )
+
+        if interactive_user_input:
+            print(
+                "[pipeline] Interactive query mode enabled. "
+                "Type a query and press Enter. Type 'exit' to quit."
+            )
+
+            turns_completed = 0
+            pending_query = user_prompt.strip()
+
+            while max_steps is None or turns_completed < max_steps:
+                if pending_query:
+                    query_text = pending_query
+                    pending_query = ""
+                    print(f"[user] {query_text}")
+                else:
+                    try:
+                        query_text = input("\n[user] > ").strip()
+                    except EOFError:
+                        print(
+                            "\n[pipeline] Input stream closed. Exiting interactive mode."
+                        )
+                        break
+                    except KeyboardInterrupt:
+                        print("\n[pipeline] Interrupted. Exiting interactive mode.")
+                        break
+
+                if not query_text:
+                    continue
+
+                if query_text.lower() in {"exit", "quit", "q"}:
+                    print("[pipeline] Exiting interactive mode.")
+                    break
+
+                scene_state = _state_provider()
+
+                if stream_llm_output:
+                    print(
+                        f"\n[agent] world_version={int(scene_state.get('world_version', -1))} "
+                        f"frame={int(scene_state.get('timestamp', -1))}",
+                        flush=True,
+                    )
+
+                turn = agent_loop.step(
+                    scene_state,
+                    user_prompt=query_text,
+                    auxiliary_context=_build_auxiliary_context(
+                        scene_state=scene_state,
+                        query_text=query_text,
+                    ),
+                    on_model_stdout=_on_model_stdout if stream_llm_output else None,
+                    on_model_stderr=_on_model_stderr if stream_llm_output else None,
+                )
+                turns_completed += 1
+
+                if stream_llm_output:
+                    print("", flush=True)
+                else:
+                    _default_turn_handler(turn)
+        else:
+            agent_loop.run(
+                state_provider=_state_provider,
+                user_prompt=user_prompt,
+                poll_interval_seconds=poll_interval_seconds,
+                require_initialized_state=False,
+                max_steps=max_steps,
+                auxiliary_context_provider=_auxiliary_context_provider,
+                on_turn=(
+                    _streaming_turn_handler
+                    if stream_llm_output
+                    else _default_turn_handler
+                ),
+                on_model_stdout=_on_model_stdout if stream_llm_output else None,
+                on_model_stderr=_on_model_stderr if stream_llm_output else None,
+            )
     finally:
         stop_event.set()
         if crop_description_thread is not None:
@@ -259,7 +532,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the perception -> local LLM MVP pipeline"
     )
-    parser.add_argument("--user-prompt", default="", help="Optional user instruction")
+    parser.add_argument(
+        "--user-prompt",
+        default="",
+        help="Optional user instruction (or first query in interactive mode).",
+    )
     parser.add_argument(
         "--quantization",
         default="Q4_K_M",
@@ -303,6 +580,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional max number of agent turns",
+    )
+    parser.add_argument(
+        "--interactive-user-input",
+        action="store_true",
+        help="Run an interactive REPL and wait for user queries on stdin.",
+    )
+    parser.add_argument(
+        "--semantic-search-top-k",
+        type=int,
+        default=5,
+        help="Top-k semantic entity matches to inject per query.",
+    )
+    parser.add_argument(
+        "--graph-history-interval-world-versions",
+        type=int,
+        default=200,
+        help="Persist world graph history every N world versions.",
+    )
+    parser.add_argument(
+        "--graph-history-max-snapshots",
+        type=int,
+        default=50,
+        help="Maximum number of world graph history snapshots to retain.",
     )
     parser.add_argument(
         "--no-stream-llm-output",
@@ -371,6 +671,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="How long to wait for embedded API ingest server startup.",
     )
+    parser.add_argument(
+        "--graph-snapshot-interval",
+        type=int,
+        default=1000,
+        help="Save world graph PNG snapshots every N world versions (0 disables).",
+    )
     return parser
 
 
@@ -386,6 +692,8 @@ def main() -> None:
             args.crop_description_poll_interval_seconds
         ),
         max_steps=args.max_steps,
+        interactive_user_input=args.interactive_user_input,
+        semantic_search_top_k=args.semantic_search_top_k,
         stream_llm_output=not args.no_stream_llm_output,
         perception_startup_timeout_seconds=args.perception_startup_timeout_seconds,
         camera_index=args.camera_index,
@@ -403,6 +711,11 @@ def main() -> None:
         llm_gpu_layers=args.llm_gpu_layers,
         llm_cpu_only=args.llm_cpu_only,
         llm_cpu_fallback=not args.no_llm_cpu_fallback,
+        graph_history_interval_world_versions=(
+            args.graph_history_interval_world_versions
+        ),
+        graph_history_max_snapshots=args.graph_history_max_snapshots,
+        graph_snapshot_interval=args.graph_snapshot_interval,
     )
 
 

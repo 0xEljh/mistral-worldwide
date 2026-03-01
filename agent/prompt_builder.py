@@ -61,6 +61,133 @@ def _format_object_descriptions_context(context: Any) -> str:
     return "\n".join(lines)
 
 
+def _format_last_visible_graph(context: Any) -> str:
+    if not isinstance(context, Mapping):
+        return "last graph unavailable"
+
+    world_version = context.get("world_version")
+    timestamp = context.get("timestamp")
+    object_labels = context.get("object_labels")
+    relation_count = context.get("relation_count")
+    relation_examples = context.get("relation_examples")
+
+    object_text = "none"
+    if isinstance(object_labels, list):
+        normalized_labels = [
+            label.strip() for label in object_labels if isinstance(label, str) and label
+        ]
+        if normalized_labels:
+            object_text = ", ".join(normalized_labels)
+
+    relation_count_text = (
+        str(int(relation_count))
+        if isinstance(relation_count, (int, float))
+        else "unknown"
+    )
+
+    summary = (
+        f"last_seen world_version={world_version} timestamp={timestamp} "
+        f"objects=[{object_text}] relations={relation_count_text}"
+    )
+
+    if isinstance(relation_examples, list):
+        examples = [
+            item.strip()
+            for item in relation_examples
+            if isinstance(item, str) and item.strip()
+        ]
+        if examples:
+            summary += "; relation_examples=" + " | ".join(examples)
+
+    return summary
+
+
+def _format_entity_memory_item(
+    item: Mapping[str, Any],
+    *,
+    include_similarity: bool,
+) -> str | None:
+    track_id = item.get("track_id", item.get("id"))
+    object_type = item.get("object_type", item.get("type"))
+    description = item.get("description")
+    currently_visible = item.get("currently_visible")
+    similarity = item.get("similarity")
+    graph_context = item.get("last_visible_graph")
+
+    if not isinstance(description, str) or not description.strip():
+        return None
+
+    if isinstance(object_type, str) and object_type.strip():
+        object_label = object_type.strip()
+    else:
+        object_label = "object"
+
+    track_text = str(track_id) if track_id is not None else "unknown"
+    visibility_text = (
+        "visible"
+        if isinstance(currently_visible, bool) and currently_visible
+        else "not visible"
+    )
+    line = f"{object_label}_{track_text} ({visibility_text})"
+
+    if include_similarity and isinstance(similarity, (int, float)):
+        line += f" sim={float(similarity):.3f}"
+
+    line += f": {description.strip()}"
+    line += f" | {_format_last_visible_graph(graph_context)}"
+    return line
+
+
+def _format_semantic_entity_matches_context(context: Any) -> str:
+    if not isinstance(context, Mapping):
+        return _safe_json_dump(context)
+
+    query = context.get("query")
+    items = context.get("items")
+
+    lines: list[str] = []
+    if isinstance(query, str) and query.strip():
+        lines.append(f'query="{query.strip()}"')
+
+    if not isinstance(items, list) or not items:
+        if lines:
+            lines.append("No semantic entity matches found.")
+            return "\n".join(lines)
+        return "No semantic entity matches available yet."
+
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        formatted = _format_entity_memory_item(item, include_similarity=True)
+        if formatted is not None:
+            lines.append(formatted)
+
+    if not lines:
+        return "No semantic entity matches available yet."
+    return "\n".join(lines)
+
+
+def _format_entity_memory_context(context: Any) -> str:
+    if not isinstance(context, Mapping):
+        return _safe_json_dump(context)
+
+    items = context.get("items")
+    if not isinstance(items, list) or not items:
+        return "No entity memory entries available yet."
+
+    lines: list[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        formatted = _format_entity_memory_item(item, include_similarity=False)
+        if formatted is not None:
+            lines.append(formatted)
+
+    if not lines:
+        return "No entity memory entries available yet."
+    return "\n".join(lines)
+
+
 def _safe_json_dump(value: Any) -> str:
     try:
         return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True)
@@ -73,11 +200,25 @@ def _format_auxiliary_context_sections(
 ) -> list[str]:
     sections: list[str] = []
 
-    for key in sorted(auxiliary_context):
+    key_priority = {
+        "object_descriptions": 0,
+        "semantic_entity_matches": 1,
+        "entity_memory": 2,
+    }
+
+    for key in sorted(
+        auxiliary_context, key=lambda item: (key_priority.get(item, 99), item)
+    ):
         value = auxiliary_context[key]
         if key == "object_descriptions":
             title = "Object descriptions (crop inference):"
             body = _format_object_descriptions_context(value)
+        elif key == "semantic_entity_matches":
+            title = "Semantic entity matches:"
+            body = _format_semantic_entity_matches_context(value)
+        elif key == "entity_memory":
+            title = "Entity memory (last visible graph):"
+            body = _format_entity_memory_context(value)
         else:
             title = f"{key.replace('_', ' ').title()}:"
             body = _safe_json_dump(value)

@@ -13,6 +13,13 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _object_node_id(obj: dict[str, Any]) -> str:
     return f"{obj.get('type', 'object')}_{obj.get('id', 'unknown')}"
 
@@ -89,9 +96,9 @@ def render_world_graph(snapshot: dict[str, Any], output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure, axes = plt.subplots(figsize=(12, 8), dpi=150)
 
-    world_version = snapshot.get("world_version", 0)
-    timestamp = snapshot.get("timestamp", 0)
-    axes.set_title(f"World Graph | world_version={world_version} frame={timestamp}")
+    world_version = _coerce_int(snapshot.get("world_version", 0), default=0)
+    timestamp = _coerce_int(snapshot.get("timestamp", 0), default=0)
+    axes.set_title(f"World Graph | world_version={world_version} timestamp={timestamp}")
 
     if not positions:
         axes.text(
@@ -214,10 +221,7 @@ class GraphSnapshotRecorder:
         self._next_snapshot_version = interval
 
     def maybe_record(self, snapshot: dict[str, Any]) -> Path | None:
-        try:
-            world_version = int(snapshot.get("world_version", 0))
-        except (TypeError, ValueError):
-            return None
+        world_version = _coerce_int(snapshot.get("world_version", 0), default=0)
 
         if world_version <= 0:
             return None
@@ -229,10 +233,13 @@ class GraphSnapshotRecorder:
             while self._next_snapshot_version <= world_version:
                 self._next_snapshot_version += self.interval
 
-            try:
-                timestamp = int(snapshot.get("timestamp", 0))
-            except (TypeError, ValueError):
-                timestamp = 0
+            raw_timestamp = _coerce_int(snapshot.get("timestamp", 0), default=0)
+            timestamp = max(world_version, raw_timestamp)
 
-            output_path = self.output_dir / f"graph_v{world_version}_f{timestamp}.png"
-            return render_world_graph(snapshot, output_path)
+            snapshot_to_render = snapshot
+            if timestamp != raw_timestamp:
+                snapshot_to_render = dict(snapshot)
+                snapshot_to_render["timestamp"] = timestamp
+
+            output_path = self.output_dir / f"graph_v{world_version}_t{timestamp}.png"
+            return render_world_graph(snapshot_to_render, output_path)

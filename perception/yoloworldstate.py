@@ -355,6 +355,8 @@ class WorldObject:
                 "moving": self.moving,
             },
             "confidence": self.confidence,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
         }
 
 
